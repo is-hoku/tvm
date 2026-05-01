@@ -2633,3 +2633,104 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         self,
     ) -> dict[torch.nn.Module | str, Callable[[fx.Node], relax.Var]]:
         """Create convert map"""
+
+
+    ########## Quantizer (as custom ops) ##########
+
+    def _dequantize_per_tensor_impl(
+        self,
+        x: relax.Expr,
+        scale: relax.Expr,
+        zero_point: relax.Expr,
+        axis: int,
+        out_dtype: str | None,
+    ):
+        return self.block_builder.emit(
+            relax.op.dequantize(
+                x,
+                scale,
+                zero_point,
+                axis,
+                out_dtype,
+            )
+        )
+
+    def _dequantize_per_tensor(self, node: fx.Node) -> relax.Var:
+        args = self.retrieve_args(node)
+        x = args[0]
+        scale = args[1]
+        zero_point = args[2]
+        quant_min = args[3]
+        quant_max = args[4]
+        dtype = args[5]
+        out_dtype = self._convert_data_type(str(dtype), self.env)
+
+        # Non-zero zero-point, asymmetric per-tensor quantization
+        # if isinstance(zero_point, int):
+        #     x_dtype = x.struct_info.dtype if hasattr(x, "struct_info") else "int8"
+        #     if "float" in x_dtype:
+        #         zero_point = relax.const(zero_point, "float32")
+        #     else:
+        #         zero_point = relax.const(zero_point, "int8")
+        # x_zp = relax.op.subtract(x, zero_point)
+
+        # if isinstance(scale, float):
+        #     scale = relax.const(scale)
+        # x_zp_float = relax.op.astype(x_zp, "float32")
+        # x_scale = relax.op.multiply(scale, x_zp_float)
+
+        # return self.block_builder.emit(relax.op.clip(x_scale, quant_min, quant_max))
+        if isinstance(scale, float):
+            scale = relax.const(scale, "float32")
+        if isinstance(zero_point, int):
+            zero_point = relax.const(zero_point, "int8")
+        return self._dequantize_per_tensor_impl(x, scale, zero_point, 0, "float32")
+
+    def _quantize_per_tensor_impl(
+        self,
+        x: relax.Expr,
+        scale: relax.Expr,
+        zero_point: relax.Expr,
+        axis: int,
+        out_dtype: str | None,
+    ):
+        return self.block_builder.emit(
+            relax.op.quantize(
+                x,
+                scale,
+                zero_point,
+                axis,
+                out_dtype,
+            )
+        )
+
+    def _quantize_per_tensor(self, node: fx.Node) -> relax.Var:
+        args = self.retrieve_args(node)
+        x = args[0]
+        scale = args[1]
+        zero_point = args[2]
+        quant_min = args[3]
+        quant_max = args[4]
+        dtype = args[5]
+        out_dtype = self._convert_data_type(str(dtype), self.env)
+
+        # Non-zero zero-point, asymmetric per-tensor quantization
+        # if isinstance(scale, float):
+        #     scale = relax.const(scale, "float32")
+        # x_float = relax.op.astype(x, "float32")
+        # x_scale = relax.op.divide(x_float, scale)
+
+        # if isinstance(zero_point, int):
+        #     zero_point = relax.const(zero_point, "float32")
+        # x_zp = relax.op.add(x_scale, zero_point)
+
+        # x_round = self.block_builder.emit(relax.op.round(x_zp))
+        # x_clip = self.block_builder.emit(relax.op.clip(x_round, quant_min, quant_max))
+
+        # return self.block_builder.emit(relax.op.astype(x_clip, out_dtype))
+
+        if isinstance(scale, float):
+            scale = relax.const(scale, "float32")
+        if isinstance(zero_point, int):
+            zero_point = relax.const(zero_point, "int8")
+        return self._quantize_per_tensor_impl(x, scale, zero_point, 0, "int8")

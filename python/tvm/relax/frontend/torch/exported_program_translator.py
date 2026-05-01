@@ -1811,6 +1811,9 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "lt": self._symbolic_comparison,
             # higher-order ops
             "cond": self._cond,
+            # quantization
+            "quantize_per_tensor.default": self._quantize_per_tensor,
+            "dequantize_per_tensor.default": self._dequantize_per_tensor,
         }
 
     def _process_derived_symbol(
