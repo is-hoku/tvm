@@ -59,6 +59,39 @@ def _check_gemmini_quantization(
     """
     return True
 
+def dequantize_conv2d_quantize_fused_pattern():
+    """
+    Dequantize+Conv2d+Quantize fusion pattern.
+    """
+
+    def _make_dequantize_conv2d_quantize_pattern():
+        input = wildcard()
+        scale = wildcard()
+        zp = wildcard()
+        # NOTE: It does not check out_dtype
+        dequantized_tensor = is_op("relax.dequantize")(input, scale, zp)
+
+        weight = wildcard()
+        #NOTE: It ignores stride and padding and does not check data layout and out_dtype
+        conv = is_op("relax.nn.conv2d")(dequantized_tensor, weight)
+
+        bias = wildcard()
+        #NOTE: It does not check data layout
+        reshape = is_op("relax.reshape")(bias)
+        resadd = is_op("relax.add")(conv, reshape)
+        output = is_op("relax.quantize")(resadd)
+
+        annotations = {
+            "input": input,
+            "scale": scale,
+            "zp": zp,
+            "weight": weight,
+            "bias": reshape,
+            "root": output,
+        }
+        return output, annotations
+
+
 def conv2d_transpose_fused_pattern():
     """
     Conv2d+Transpose fusion pattern.

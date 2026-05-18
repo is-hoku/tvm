@@ -19,7 +19,7 @@
 
 /*!
  * \file src/relax/backend/contrib/gemmini/codegen.cc
- * \brief Implementation of the Gemmini C code generator for Relax.
+ * \brief Implementation of the Gemmini code generator for Relax.
  */
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/module.h>
@@ -41,28 +41,23 @@ namespace tvm {
 namespace relax {
 namespace contrib {
 
-std::string EmitSignature(const std::vector<Output>& out, const std::string& func_id,
-                          const std::vector<std::string>& arg_names) {
-  std::ostringstream code_stream_;
-  code_stream_ << "void " << func_id << "_(";
-  for (const auto& arg_name : arg_names) {
-    code_stream_ << "DLTensor* " << arg_name << ", ";
-  }
-  for (size_t i = 0; i < out.size() - 1; ++i) {
-    code_stream_ << "DLTensor* out" << i << ", ";
-  }
-  code_stream_ << "DLTensor* out" << out.size() - 1 << ")";
-  return code_stream_.str();
-}
-
 ffi::Module Finalize(const std::string& code, const ffi::Array<ffi::String>& func_names) {
   TVM_FFI_ICHECK(!func_names.empty())
       << "Should only create Gemmini CSourceModule if there is at least one Gemmini partition";
 
   std::ostringstream default_headers;
-  default_headers << "#include <tvm/ffi/function.h>\n";
-  default_headers << "#include <dlpack/dlpack.h>\n";
-  default_headers << "#include <gemmini.h>\n";
+  //default_headers << "#include <tvm/ffi/function.h>\n";
+  //default_headers << "#include <dlpack/dlpack.h>\n";
+  default_headers << "#include <assert.h>\n";
+  default_headers << "#include <stddef.h>\n";
+  default_headers << "#include <stdint.h>\n";
+  default_headers << "#include <stdio.h>\n";
+  default_headers << "#include <stdlib.h>\n";
+  default_headers << "#ifndef BAREMETAL\n";
+  default_headers << "#include <sys/mman.h>\n";
+  default_headers << "#endif\n";
+  default_headers << "#include \"include/gemmini_params.h\"\n";
+  default_headers << "#include \"include/gemmini.h\"\n";
 
   const auto pf = tvm::ffi::Function::GetGlobalRequired("runtime.CSourceModuleCreate");
   VLOG(1) << "Generated Gemmini code:" << std::endl << code;
@@ -71,42 +66,6 @@ ffi::Module Finalize(const std::string& code, const ffi::Array<ffi::String>& fun
       .cast<ffi::Module>();
 }
 
-GenerateBodyOutput GenerateBody(const std::string& func_name, const std::string& ext_func_id,
-                                const std::vector<std::string>& output_types,
-                                const ffi::Array<ffi::String>& func_args,
-                                const ffi::Map<ffi::String, ffi::Any>& attrs, int* buf_idx) {
-  TVM_FFI_ICHECK_GT(func_args.size(), 0);
-  std::ostringstream decl_stream;
-  decl_stream << "(" << func_args[0];
-  for (size_t i = 1; i < func_args.size(); ++i) {
-    decl_stream << ", " << func_args[i];
-  }
-
-  GenerateBodyOutput ret;
-  for (const auto& out_type : output_types) {
-    const std::string out = "out" + std::to_string(*buf_idx++);
-    decl_stream << ", " << out;
-    Output output;
-    output.name = out;
-    output.dtype = out_type;
-    output.need_copy = false;
-    ret.outputs.push_back(output);
-  }
-  decl_stream << ");";
-
-  // TODO: implement Gemmini C code generation per op (func_name / attrs を見て分岐)
-  //   if (func_name == "gemmini.matmul") { ... tiled_matmul_auto(...) ... }
-  //   if (func_name == "gemmini.conv2d") { ... tiled_conv_auto(...) ... }
-  if (func_name == "gemmini.matmul") {
-    ret.decl << "tiled_matmul_auto()"
-  }
-  if (func_name == "gemmini.conv2d") {
-    ret.decl << "tiled_conv_auto()"
-  }
-  ret.headers = {};
-
-  return ret;
-}
 
 using OutputType = std::vector<Output>;
 
@@ -123,24 +82,19 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
   }
 
   std::string JIT(const OutputType& out) final {
-    std::vector<std::string> arg_types, arg_names;
+    code_stream_ << "void " << ext_func_id_ << "_(";
 
     for (const auto& arg : ext_func_args_) {
-      auto sinfo = GetStructInfo(arg);
-      if (const auto* tensor_sinfo = sinfo.as<TensorStructInfoNode>()) {
-        arg_types.emplace_back(backend::DType2String(tensor_sinfo->dtype));
-      } else if (const auto* shape_sinfo = sinfo.as<ShapeStructInfoNode>()) {
-        arg_types.emplace_back(backend::DType2String(shape_sinfo->values.value()[0]->dtype));
-      } else {
-        TVM_FFI_THROW(InternalError) << "Unimplemented";
-      }
-      arg_names.push_back(var_name_map_.at(arg.get()));
+      const auto& dtype_str = GetDtypeString(arg);
+      code_stream_ << dtype_str << "* " << arg->name_hint() << ", ";
     }
-
-    code_stream_ << EmitSignature(out, ext_func_id_, arg_names) << "{\n";
-
+    for (size_t i = 0; i < out.size() - 1; ++i) {
+      code_stream_ << out[i].dtype << "* out" << i << ", ";
+    }
+    code_stream_ << out.back().dtype << "* out" << out.size() - 1 << ") {\n";
     this->EnterScope();
 
+    // Function body
     for (auto decl : buf_decl_) {
       this->PrintIndents();
       code_stream_ << decl << "\n";
@@ -154,7 +108,6 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
     this->ExitScope();
     code_stream_ << "}\n";
 
-    this->GenerateBackendCFunc(ext_func_id_, arg_types, /*const_arr_name=*/"", out, true);
     return code_stream_.str();
   }
 
@@ -173,7 +126,7 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
     const auto func = Downcast<Function>(bindings_[ffi::GetRef<Var>(fn_var)]);
     const auto pattern_name_opt = func->GetAttr<ffi::String>(attr::kComposite);
     TVM_FFI_ICHECK(pattern_name_opt) << "Only composite function is supported for Gemmini.";
-    auto ret = GenerateBody(call, pattern_name_opt.value(), func->attrs->dict);
+    auto ret = GenerateBody(call, pattern_name_opt.value());
     ext_func_body_.push_back(ret.decl);
     return ret.outputs;
   }
@@ -181,6 +134,7 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
   OutputType VisitExpr_(const FunctionNode* fn) final {
     TVM_FFI_ICHECK(fn->GetAttr<ffi::String>(attr::kComposite).has_value())
         << "JSON runtime only supports composite functions";
+    // FunctionNode should be handled by the caller.
     return {};
   }
 
@@ -252,35 +206,61 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
     return arg_names;
   }
 
-  GenerateBodyOutput GenerateBody(const CallNode* call, const std::string& func_name,
-                                  const ffi::Map<ffi::String, ffi::Any>& attrs) {
+  GenerateBodyOutput GenerateBody(const CallNode* call, const std::string& func_name) {
     auto func_args = GetArgumentNames(call);
     auto struct_info = GetStructInfo(ffi::GetRef<Call>(call));
 
-    std::vector<std::string> out_types;
-    if (const auto* tensor_sinfo = struct_info.as<TensorStructInfoNode>()) {
-      out_types.emplace_back(backend::DType2String(tensor_sinfo->dtype));
-    } else {
-      TVM_FFI_THROW(InternalError) << "Unimplemented sinfo type: " << struct_info;
-    }
+	const auto* out_sinfo = struct_info.as<TensorStructInfoNode>();
 
-    return contrib::GenerateBody(func_name, ext_func_id_, out_types, func_args, attrs, &buf_idx_);
+    const std::string out_name = "out" + std::to_string(buf_idx_++);
+    Output output;
+    output.name = out_name;
+    output.dtype = GetDtypeString(out_sinfo);
+    output.need_copy = false;
+    GenerateBodyOutput ret;
+    ret.outputs.push_back(output);
+
+	std::cout << func_name;
+	if (func_name == "gemmini.matmul") {
+		ret.decl = EmitGemminiMatmul(call, func_args, out_name);
+	} else if (func_name == "gemmini.conv2d") {
+		ret.decl = EmitGemminiConv2d(call, func_args, out_name);
+	} else {
+		TVM_FFI_THROW(InternalError) << "Unsupported Gemmini op: " << func_name;
+	}
+
+    return ret;
   }
 
-  /*! \brief The id of the external Gemmini function. */
+  std::string EmitGemminiMatmul(const CallNode* call, const ffi::Array<ffi::String>& args, const std::string& out) {
+	  return "tiled_matmul_auto()";
+  }
+
+  std::string EmitGemminiConv2d(const CallNode* call, const ffi::Array<ffi::String>& args, const std::string& out) {
+	  return "tiled_conv2d_auto()";
+  }
+
+  /*! \brief The id of the external gemmini ext_func. */
   std::string ext_func_id_;
-  /*! \brief The index to track the output buffer. */
+  /*!
+   * \brief The index to track the output buffer. Each kernel will redirect the
+   * output to a buffer that may be consumed by other kernels.
+   */
   int buf_idx_{0};
   /*! \brief The arguments used by a wrapped function that calls Gemmini kernels. */
   ffi::Array<Var> ext_func_args_;
-  /*! \brief The statements of the function that will be compiled using Gemmini. */
+  /*! \brief The statements of the function that will be compiled using Gemmini kernels. */
   std::vector<std::string> ext_func_body_;
   /*! \brief The declaration of intermediate buffers. */
   std::vector<std::string> buf_decl_;
   /*! \brief The binding to look up composite functions. */
   ffi::Map<Var, Expr> bindings_;
+  /*! \brief Required header-file names.
+  ffi::Array<ffi::String> headers_; */
   /*!
    * \brief A mapping from a variable to its unique name.
+   * We use this since sometimes different parameters to the same function end up having the same
+   * name_hint.
    */
   std::unordered_map<const VarNode*, std::string> var_name_map_;
   /*! \brief A name supply to generate a unique name for each parameter. */
@@ -289,7 +269,8 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 
 class GemminiModuleCodegen {
  public:
-  ffi::Module CreateCSourceModule(ffi::Array<Function> functions) {
+  ffi::Module CreateCSourceModule(ffi::Array<Function> functions,
+                                  const ffi::Map<ffi::String, ffi::Any>& options) {
     std::string code = "";
     for (const auto& f : functions) {
       code += "\n" + GenGemminiFunc(f);
@@ -321,15 +302,14 @@ class GemminiModuleCodegen {
 ffi::Array<ffi::Module> GemminiCompiler(ffi::Array<Function> functions,
                                         ffi::Map<ffi::String, ffi::Any> options,
                                         ffi::Map<Constant, ffi::String> /*unused*/) {
-  auto source_mod = GemminiModuleCodegen().CreateCSourceModule(functions);
+  auto source_mod = GemminiModuleCodegen().CreateCSourceModule(functions, options);
+  const auto pf = tvm::ffi::Function::GetGlobal("contrib.gemmini.compile");
+  TVM_FFI_ICHECK(pf.has_value())
+      << "The packed function contrib.gemmini.compile not found, please import "
+         "tvm.contrib.gemmini.build";
+  ffi::Module gemmini_mod = (*pf)(source_mod, options).cast<ffi::Module>();
 
-  // TODO: RISC-V cross-compilation
-  // const auto pf = tvm::ffi::Function::GetGlobal("contrib.gemmini.compile");
-  // if (pf.has_value()) {
-  //   return {(*pf)(source_mod, options).cast<ffi::Module>()};
-  // }
-
-  return {source_mod};
+  return {gemmini_mod};
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {

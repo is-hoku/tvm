@@ -321,3 +321,6 @@ SET(CMAKE_VS_PLATFORM_TOOLSET_HOST_ARCHITECTURE "x64")
 
 # Enable Qualcomm OpenCL extension support
 set(USE_OPENCL_EXTN_QCOM OFF)
+
+# Gemmini
+set(USE_GEMMINI_CONDEGEN ON)
