@@ -739,6 +739,18 @@ def FoldConstant() -> tvm.ir.transform.Pass:
     return _ffi_api.FoldConstant()  # type: ignore
 
 
+def FoldRedundantBroadcastTo() -> tvm.ir.transform.Pass:
+    """Fold redundant broadcast_to ops.
+
+    relax.broadcast_to(a, shape) where a.shape == shape
+
+    Returns
+    -------
+    ret: tvm.ir.transform.Pass
+    """
+    return _ffi_api.FoldRedundantBroadcastTo()  # type: ignore
+
+
 def ExpandTupleArguments() -> tvm.ir.transform.Pass:
     """Expand tuple arguments to internal functions
 

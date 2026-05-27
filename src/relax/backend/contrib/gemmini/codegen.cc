@@ -126,7 +126,7 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
     const auto func = Downcast<Function>(bindings_[ffi::GetRef<Var>(fn_var)]);
     const auto pattern_name_opt = func->GetAttr<ffi::String>(attr::kComposite);
     TVM_FFI_ICHECK(pattern_name_opt) << "Only composite function is supported for Gemmini.";
-    auto ret = GenerateBody(call, pattern_name_opt.value());
+    auto ret = GenerateBody(call, pattern_name_opt.value(), func->attrs->dict);
     ext_func_body_.push_back(ret.decl);
     return ret.outputs;
   }
@@ -206,7 +206,8 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
     return arg_names;
   }
 
-  GenerateBodyOutput GenerateBody(const CallNode* call, const std::string& func_name) {
+  GenerateBodyOutput GenerateBody(const CallNode* call, const std::string& func_name,
+		  						  const ffi::Map<ffi::String, ffi::Any>& attrs) {
     auto func_args = GetArgumentNames(call);
     auto struct_info = GetStructInfo(ffi::GetRef<Call>(call));
 
@@ -220,11 +221,20 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
     GenerateBodyOutput ret;
     ret.outputs.push_back(output);
 
-	std::cout << func_name;
-	if (func_name == "gemmini.matmul") {
-		ret.decl = EmitGemminiMatmul(call, func_args, out_name);
-	} else if (func_name == "gemmini.conv2d") {
+	if (func_name == "gemmini.conv2d") {
 		ret.decl = EmitGemminiConv2d(call, func_args, out_name);
+	} else if (func_name == "gemmini.matmul") {
+		ret.decl = EmitGemminiMatmul(call, func_args, out_name);
+	} else if (func_name == "gemmini.matmul_softmax") {
+		ret.decl = EmitGemminiMatmulSoftmax(call, func_args, out_name);
+	} else if (func_name == "gemmini.resadd_leakyrelu") {
+		ret.decl = EmitGemminiResaddLeakyReLU(call, func_args, out_name);
+	} else if (func_name == "gemmini.conv2d_leakyrelu") {
+		ret.decl = EmitGemminiConv2dLeakyReLU(call, func_args, out_name);
+	} else if (func_name == "gemmini.fc") {
+		ret.decl = EmitGemminiFC(call, func_args, out_name);
+	} else if (func_name == "gemmini.fc_leakyrelu") {
+		ret.decl = EmitGemminiFC(call, func_args, out_name);
 	} else {
 		TVM_FFI_THROW(InternalError) << "Unsupported Gemmini op: " << func_name;
 	}
@@ -232,12 +242,39 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
     return ret;
   }
 
+  std::string EmitGemminiConv2d(const CallNode* call, const ffi::Array<ffi::String>& args, const std::string& out) {
+	  std::cout << call->args[0];
+	  std::cout << args[0];
+	  std::cout << out;
+	  return "tiled_conv2d_auto()";
+  }
+
   std::string EmitGemminiMatmul(const CallNode* call, const ffi::Array<ffi::String>& args, const std::string& out) {
 	  return "tiled_matmul_auto()";
   }
 
-  std::string EmitGemminiConv2d(const CallNode* call, const ffi::Array<ffi::String>& args, const std::string& out) {
-	  return "tiled_conv2d_auto()";
+  std::string EmitGemminiMatmulSoftmax(const CallNode* call, const ffi::Array<ffi::String>& args, const std::string& out) {
+	  return "tiled_matmul_auto(softmax)";
+  }
+
+  std::string EmitGemminiResaddLeakyReLU(const CallNode* call, const ffi::Array<ffi::String>& args, const std::string& out) {
+
+	  return "tiled_resadd_auto(leakyrelu)";
+  }
+
+  std::string EmitGemminiConv2dLeakyReLU(const CallNode* call, const ffi::Array<ffi::String>& args, const std::string& out) {
+
+	  return "tiled_conv2d_auto(leakyrelu)";
+  }
+
+  std::string EmitGemminiFC(const CallNode* call, const ffi::Array<ffi::String>& args, const std::string& out) {
+
+	  return "tiled_matmul_auto(bias)";
+  }
+
+  std::string EmitGemminiFCLeakyReLU(const CallNode* call, const ffi::Array<ffi::String>& args, const std::string& out) {
+
+	  return "tiled_matmul_auto(bias, leakyrelu)";
   }
 
   /*! \brief The id of the external gemmini ext_func. */
