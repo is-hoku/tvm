@@ -72,8 +72,9 @@ using OutputType = std::vector<Output>;
 class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
                        public relax::contrib::CodegenCBase {
  public:
-  CodegenGemmini(const std::string& id, const ffi::Map<Var, Expr>& bindings)
-      : ext_func_id_(id), bindings_(bindings) {}
+  CodegenGemmini(const std::string& id, const ffi::Map<Var, Expr>& bindings,
+                 const ffi::Map<Constant, ffi::String>& constant_names)
+      : ext_func_id_(id), bindings_(bindings), constant_names_(constant_names) {}
 
   void AddParm(Var param) {
     ext_func_args_.push_back(param);
@@ -292,8 +293,8 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
   std::vector<std::string> buf_decl_;
   /*! \brief The binding to look up composite functions. */
   ffi::Map<Var, Expr> bindings_;
-  /*! \brief Required header-file names.
-  ffi::Array<ffi::String> headers_; */
+  /*! \brief Map from Constant node to its string name (from RunCodegen). */
+  ffi::Map<Constant, ffi::String> constant_names_;
   /*!
    * \brief A mapping from a variable to its unique name.
    * We use this since sometimes different parameters to the same function end up having the same
@@ -306,6 +307,9 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 
 class GemminiModuleCodegen {
  public:
+  explicit GemminiModuleCodegen(ffi::Map<Constant, ffi::String> constant_names)
+      : constant_names_(std::move(constant_names)) {}
+
   ffi::Module CreateCSourceModule(ffi::Array<Function> functions,
                                   const ffi::Map<ffi::String, ffi::Any>& options) {
     std::string code = "";
@@ -322,7 +326,7 @@ class GemminiModuleCodegen {
     auto sid = GetExtSymbol(function);
     func_names_.push_back(sid);
 
-    CodegenGemmini builder(sid, AnalyzeVar2Value(function));
+    CodegenGemmini builder(sid, AnalyzeVar2Value(function), constant_names_);
 
     for (const auto& p : function->params) {
       builder.AddParm(p);
@@ -334,12 +338,14 @@ class GemminiModuleCodegen {
 
   /*! \brief The accumulated function names. */
   ffi::Array<ffi::String> func_names_;
+  /*! \brief Map from Constant node to its string name. */
+  ffi::Map<Constant, ffi::String> constant_names_;
 };
 
 ffi::Array<ffi::Module> GemminiCompiler(ffi::Array<Function> functions,
                                         ffi::Map<ffi::String, ffi::Any> options,
-                                        ffi::Map<Constant, ffi::String> /*unused*/) {
-  auto source_mod = GemminiModuleCodegen().CreateCSourceModule(functions, options);
+                                        ffi::Map<Constant, ffi::String> constant_names) {
+  auto source_mod = GemminiModuleCodegen(constant_names).CreateCSourceModule(functions, options);
   const auto pf = tvm::ffi::Function::GetGlobal("contrib.gemmini.compile");
   TVM_FFI_ICHECK(pf.has_value())
       << "The packed function contrib.gemmini.compile not found, please import "

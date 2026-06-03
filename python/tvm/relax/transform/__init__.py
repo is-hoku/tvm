@@ -42,7 +42,6 @@ from .transform import (
     ExpandMatmulOfSum,
     ExpandTupleArguments,
     FoldConstant,
-    FoldQuantizeDequantize,
     FoldRedundantBroadcastTo,
     FunctionPass,
     FuseOps,
