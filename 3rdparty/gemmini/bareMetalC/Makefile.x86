@@ -1,0 +1,23 @@
+# Makefile for standalone x86 version of BraggNN
+# This compiles the code to run natively on x86 host without Gemmini
+
+CC = gcc
+CFLAGS = -O2 -Wall -Wextra -std=c99
+LDFLAGS = -lm
+INCLUDES = -I. -I../include
+
+TARGET = braggnn_cpu_x86
+SOURCE = braggnn_cpu_x86.c
+
+all: $(TARGET)
+
+$(TARGET): $(SOURCE) braggnn.h
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
+
+clean:
+	rm -f $(TARGET)
+
+run: $(TARGET)
+	./$(TARGET)
+
+.PHONY: all clean run

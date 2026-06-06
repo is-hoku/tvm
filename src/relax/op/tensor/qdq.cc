@@ -243,16 +243,5 @@ TVM_REGISTER_OP("relax.dequantize")
     .add_argument("zero_point", "Tensor", "The quantization zero_point of the input tensor.")
     .set_attr<FInferStructInfo>("FInferStructInfo", InferStructInfoDequantize)
     .set_attr<Bool>("FPurity", Bool(true));
-
-
-TVM_REGISTER_OP("gemmini.requant")
-    .set_attrs_type<QuantizeAttrs>()
-    .set_num_inputs(3)
-    .add_argument("data", "Tensor", "The input tensor.")
-    .add_argument("scale", "Tensor", "The quantization scale of the input tensor.")
-    .add_argument("zero_point", "Tensor", "The quantization zero_point of the input tensor.")
-    .set_attr<FInferStructInfo>("FInferStructInfo", InferStructInfoQuantize)
-    .set_attr<Bool>("FPurity", Bool(true));
-
 }  // namespace relax
 }  // namespace tvm

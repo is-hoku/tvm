@@ -127,7 +127,7 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
     const auto func = Downcast<Function>(bindings_[ffi::GetRef<Var>(fn_var)]);
     const auto pattern_name_opt = func->GetAttr<ffi::String>(attr::kComposite);
     TVM_FFI_ICHECK(pattern_name_opt) << "Only composite function is supported for Gemmini.";
-    auto ret = GenerateBody(call, pattern_name_opt.value(), func->attrs->dict);
+    auto ret = GenerateBody(call, pattern_name_opt.value(), func);
     ext_func_body_.push_back(ret.decl);
     return ret.outputs;
   }
@@ -207,10 +207,11 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
     return arg_names;
   }
 
-  GenerateBodyOutput GenerateBody(const CallNode* call, const std::string& func_name,
-		  						  const ffi::Map<ffi::String, ffi::Any>& attrs) {
-    auto func_args = GetArgumentNames(call);
+  GenerateBodyOutput GenerateBody(const CallNode* call, const std::string& f,
+		  						  const Function& func) {
+    //auto func_args = GetArgumentNames(call);
     auto struct_info = GetStructInfo(ffi::GetRef<Call>(call));
+	//attrs = func->attrs->dict;
 
 	const auto* out_sinfo = struct_info.as<TensorStructInfoNode>();
 
@@ -222,60 +223,223 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
     GenerateBodyOutput ret;
     ret.outputs.push_back(output);
 
-	if (func_name == "gemmini.conv2d") {
-		ret.decl = EmitGemminiConv2d(call, func_args, out_name);
-	} else if (func_name == "gemmini.matmul") {
-		ret.decl = EmitGemminiMatmul(call, func_args, out_name);
-	} else if (func_name == "gemmini.matmul_softmax") {
-		ret.decl = EmitGemminiMatmulSoftmax(call, func_args, out_name);
-	} else if (func_name == "gemmini.resadd_leakyrelu") {
-		ret.decl = EmitGemminiResaddLeakyReLU(call, func_args, out_name);
-	} else if (func_name == "gemmini.conv2d_leakyrelu") {
-		ret.decl = EmitGemminiConv2dLeakyReLU(call, func_args, out_name);
-	} else if (func_name == "gemmini.fc") {
-		ret.decl = EmitGemminiFC(call, func_args, out_name);
-	} else if (func_name == "gemmini.fc_leakyrelu") {
-		ret.decl = EmitGemminiFC(call, func_args, out_name);
+	if (f == "gemmini.conv2d" ||
+		f == "gemmini.conv2d_leakyrelu") {
+		ret.decl = EmitGemminiConv2d(call, func, out_name, f);
+	} else if (f == "gemmini.matmul" ||
+			   f == "gemmini.matmul_softmax" ||
+			   f == "gemmini.matmul_transpose" ||
+			   f == "gemmini.fc" ||
+			   f == "gemmini.fc_leakyrelu") {
+		ret.decl = EmitGemminiMatmul(call, func, out_name, f);
+	} else if (f == "gemmini.resadd_leakyrelu") {
+		ret.decl = EmitGemminiResadd(call, func, out_name, f);
 	} else {
-		TVM_FFI_THROW(InternalError) << "Unsupported Gemmini op: " << func_name;
+		TVM_FFI_THROW(InternalError) << "Unsupported Gemmini op: " << f;
 	}
 
     return ret;
   }
 
-  std::string EmitGemminiConv2d(const CallNode* call, const ffi::Array<ffi::String>& args, const std::string& out) {
-	  std::cout << call->args[0];
-	  std::cout << args[0];
-	  std::cout << out;
-	  return "tiled_conv2d_auto()";
+  std::string EmitGemminiConv2d(const CallNode* call, const Function& func, const std::string& out, const std::string& func_name) {
+      ffi::Array<ffi::String> func_args = GetArgumentNames(call);
+	  ffi::Map<ffi::String, ffi::Any> attrs = func->attrs->dict;
+
+	  auto arg_idx = backend::ExtractArgIdx(func_name, func);
+
+	  int64_t i_idx = arg_idx["input"]->value;
+	  int64_t w_idx = arg_idx["weight"]->value;
+	  int64_t b_idx = arg_idx["bias"]->value;
+
+	  // NCHW
+	  const auto* in_sinfo = GetStructInfo(func->params[i_idx]).as<TensorStructInfoNode>();
+	  auto in_shape = backend::GetIntShape(in_sinfo->shape.value().as<ShapeExprNode>()->values);
+
+	  // OHWI
+	  const auto* w_sinfo = GetStructInfo(func->params[w_idx]).as<TensorStructInfoNode>();
+	  auto w_shape = backend::GetIntShape(w_sinfo->shape.value().as<ShapeExprNode>()->values);
+
+	  // NCHW
+	  //auto* out_sinfo = GetStructInfo(ffi::GetRef<Call>(call)).as<TensorStructInfoNode>();
+	  //auto out_shape = backend::GetIntShape(out_sinfo->shape.value().as<ShapeExprNode>()->values);
+
+	  int64_t batch_size = in_shape[0];
+	  int64_t in_rows = in_shape[2];
+	  int64_t in_cols = in_shape[3];
+	  int64_t in_channels = in_shape[1];
+	  int64_t out_channels = w_shape[0];
+
+	  std::string act = attrs.at("act").try_cast<std::string>().value();
+	  double acc_scale = attrs.at("acc_scale").try_cast<double>().value();
+	  int stride = attrs.at("stride").try_cast<int>().value();
+	  int padding = attrs.at("padding").try_cast<int>().value();
+	  int kernel_dim = attrs.at("kernel_dim").try_cast<int>().value();
+
+	  int64_t out_rows = (in_rows + 2 * padding - kernel_dim) / stride + 1;
+	  int64_t out_cols = (in_cols + 2 * padding - kernel_dim) / stride + 1;
+
+	  std::ostringstream ss;
+
+	//tiled_conv_auto(int batch_size, int in_row_dim, int in_col_dim,
+    //                int in_channels, int out_channels, int out_row_dim,
+    //                int out_col_dim, int stride, int input_dilation,
+    //                int kernel_dilation, int padding, int kernel_dim,
+    //                bool wrot180, bool trans_output_1203,
+    //                bool trans_input_3120, bool trans_weight_1203,
+    //                bool trans_weight_0132,
+
+    //                const elem_t *input, const elem_t *weights,
+    //                const acc_t *bias, elem_t *output,
+
+    //                int act, acc_scale_t scale, int pool_size,
+    //                int pool_stride, int pool_padding,
+
+    //                enum tiled_matmul_type_t tiled_conv_type) {
+	  ss << "tiled_conv2d_auto("
+		 << batch_size << ", "
+		 << in_rows << ", "
+		 << in_cols << ", "
+		 << in_channels << ", "
+		 << out_channels << ", "
+		 << out_rows << ", "
+		 << out_cols << ", "
+		 << stride << ", "
+		 << "1, "
+		 << "1, "
+		 << padding << ", "
+		 << kernel_dim << ", "
+		 << "false, false, false, false, false, "
+	  	 << "(elem_t*)" << func_args[i_idx] << ", "
+	  	 << "(elem_t*)" << func_args[w_idx] << ", "
+	  	 << "(acc_t*)" << func_args[b_idx] << ", "
+	  	 << "(elem_t*)" << out << ", "
+		 << act << ", "
+		 << acc_scale << ", "
+		 << "0, 0, 0, "
+		 << "WS);";
+
+	  return ss.str();
   }
 
-  std::string EmitGemminiMatmul(const CallNode* call, const ffi::Array<ffi::String>& args, const std::string& out) {
+  std::string EmitGemminiMatmul(const CallNode* call, const Function& func, const std::string& out, const std::string func_name) {
+      ffi::Array<ffi::String> func_args = GetArgumentNames(call);
+	  ffi::Map<ffi::String, ffi::Any> attrs = func->attrs->dict;
+
+	  auto arg_idx = backend::ExtractArgIdx(func_name, func);
+
+	  int64_t in_idx = arg_idx["input"]->value;
+	  int64_t w_idx = arg_idx["weight"]->value;
+
+	  // NCHW
+	  const auto* in_sinfo = GetStructInfo(func->params[in_idx]).as<TensorStructInfoNode>();
+	  auto in_shape = backend::GetIntShape(in_sinfo->shape.value().as<ShapeExprNode>()->values);
+
+	  // NCHW
+	  const auto* w_sinfo = GetStructInfo(func->params[w_idx]).as<TensorStructInfoNode>();
+	  auto w_shape = backend::GetIntShape(w_sinfo->shape.value().as<ShapeExprNode>()->values);
+
+	  std::string bias = "NULL";
+	  if (arg_idx.count("bias")) {
+		  bias = func_args[arg_idx["bias"]->value];
+	  }
+
+	  // NCHW
+	  //auto* out_sinfo = GetStructInfo(ffi::GetRef<Call>(call)).as<TensorStructInfoNode>();
+	  //auto out_shape = backend::GetIntShape(out_sinfo->shape.value().as<ShapeExprNode>()->values);
+
+	  // TODO: handling transpose tensors
+	  int64_t dim_I = in_shape[in_shape.size() - 2]; // 2
+	  int64_t dim_J = w_shape[w_shape.size() - 1]; // 3
+	  int64_t dim_K = in_shape.back();
+	  bool transpose_B = (in_shape[in_shape.size() - 1] != w_shape[w_shape.size() - 2] ? true : false);
+	  int64_t stride_A = dim_K;
+	  int64_t stride_B = in_shape.back();
+	  int64_t stride_C = dim_J;
+	  int64_t stride_D = dim_J;
+
+	  std::string act = attrs.at("act").try_cast<std::string>().value();
+	  double acc_scale = attrs.at("acc_scale").try_cast<double>().value();
+
+	  std::ostringstream ss;
+
+	//tiled_matmul_auto(size_t dim_I, size_t dim_J, size_t dim_K, const elem_t *A,
+	//                  const elem_t *B, const void *D, void *C, size_t stride_A,
+	//                  size_t stride_B, size_t stride_D, size_t stride_C,
+	//                  scale_t A_scale_factor, scale_t B_scale_factor,
+	//                  scale_acc_t D_scale_factor, int act, acc_scale_t scale,
+	//                  acc_scale_t bert_scale, bool repeating_bias, bool transpose_A,
+	//                  bool transpose_B, bool full_C, bool low_D, uint8_t weightA,
+	//                  enum tiled_matmul_type_t tiled_matmul_type) {
+	  ss << "tiled_matmul_auto("
+		 << dim_I << ", "
+		 << dim_J << ", "
+		 << dim_K << ", "
+		 << "(elem_t*)" << func_args[in_idx] << ", "
+		 << "(elem_t*)" << func_args[w_idx] << ", "
+		 << bias << ", "
+		 << "(elem_t*)" << out << ", "
+		 << stride_A << ", " // stride_A
+		 << stride_B << ", " // stride_B
+		 << stride_D << ", " // stride_D
+		 << stride_C << ", " // stride_C
+		 << "MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, "
+		 << act << ", "
+		 << acc_scale << ", " // scale
+		 << "0, " // bert_scale
+		 << "false, false, "
+		 << transpose_B << ", "
+		 << "false, false, false, 0, "
+		 << "WS);";
+
+	  return ss.str();
 	  return "tiled_matmul_auto()";
   }
 
-  std::string EmitGemminiMatmulSoftmax(const CallNode* call, const ffi::Array<ffi::String>& args, const std::string& out) {
-	  return "tiled_matmul_auto(softmax)";
-  }
+  std::string EmitGemminiResadd(const CallNode* call, const Function& func, const std::string& out, const std::string func_name) {
+      ffi::Array<ffi::String> func_args = GetArgumentNames(call);
+	  ffi::Map<ffi::String, ffi::Any> attrs = func->attrs->dict;
 
-  std::string EmitGemminiResaddLeakyReLU(const CallNode* call, const ffi::Array<ffi::String>& args, const std::string& out) {
+	  auto arg_idx = backend::ExtractArgIdx(func_name, func);
 
-	  return "tiled_resadd_auto(leakyrelu)";
-  }
+	  int64_t i0_idx = arg_idx["input0"]->value;
+	  int64_t i1_idx = arg_idx["input1"]->value;
 
-  std::string EmitGemminiConv2dLeakyReLU(const CallNode* call, const ffi::Array<ffi::String>& args, const std::string& out) {
+	  // NCHW
+	  const auto* i0_sinfo = GetStructInfo(func->params[i0_idx]).as<TensorStructInfoNode>();
+	  auto i0_shape = backend::GetIntShape(i0_sinfo->shape.value().as<ShapeExprNode>()->values);
 
-	  return "tiled_conv2d_auto(leakyrelu)";
-  }
+	  // NCHW
+	  const auto* i1_sinfo = GetStructInfo(func->params[i1_idx]).as<TensorStructInfoNode>();
+	  auto i1_shape = backend::GetIntShape(i1_sinfo->shape.value().as<ShapeExprNode>()->values);
 
-  std::string EmitGemminiFC(const CallNode* call, const ffi::Array<ffi::String>& args, const std::string& out) {
+	  int64_t I = i0_shape[2];
+	  int64_t J = i0_shape[3];
+	  std::string A_scale = func_args[arg_idx["scale_in"]->value];
+	  std::string B_scale = func_args[arg_idx["scale_w"]->value];
+	  std::string C_scale = func_args[arg_idx["scale_out"]->value];
 
-	  return "tiled_matmul_auto(bias)";
-  }
+	  bool relu = attrs.at("relu").try_cast<bool>().value();
 
-  std::string EmitGemminiFCLeakyReLU(const CallNode* call, const ffi::Array<ffi::String>& args, const std::string& out) {
+	  std::ostringstream ss;
 
-	  return "tiled_matmul_auto(bias, leakyrelu)";
+//	_STATIC void tiled_resadd_auto(const size_t I, const size_t J,
+//	                               const scale_t A_scale, const scale_t B_scale,
+//	                               const acc_scale_t C_scale, const elem_t *A,
+//	                               const elem_t *B, elem_t *C, bool relu,
+//	                               enum tiled_matmul_type_t matadd_type) {
+	  ss << "tiled_resadd_auto("
+		 << I << ", "
+		 << J << ", "
+		 << A_scale << ", "
+		 << B_scale << ", "
+		 << C_scale << ", "
+	  	 << "(elem_t*)" << func_args[i0_idx] << ", "
+	  	 << "(elem_t*)" << func_args[i1_idx] << ", "
+		 << "(elem_t*)" << out << ", "
+		 << relu << ", "
+		 << "WS);";
+
+	  return ss.str();
   }
 
   /*! \brief The id of the external gemmini ext_func. */

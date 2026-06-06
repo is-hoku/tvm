@@ -72,31 +72,35 @@ def conv2d_pattern():
         s0 = wildcard()
         z0 = wildcard()
         d = is_op("relax.dequantize")(x0, s0, z0)
+        d_t = is_op("relax.permute_dims")(d) | d
 
         wi8 = wildcard()
         sw = wildcard()
         zpw = wildcard()
         weight = is_op("relax.dequantize")(wi8, sw, zpw)
-        #NOTE: It ignores stride and padding and does not check data layout and out_dtype
-        conv = is_op("relax.nn.conv2d")(d, weight)
+        # When putting ConvertLayout before FuseOpsByPattern inserts the relax.permute_dims to transpose weights as NHWC that is required by Gemmini from NCHW that is a representation in PyTorch
+        weight_t = is_op("relax.permute_dims")(weight) | weight
+
+        conv = is_op("relax.nn.conv2d")(d_t, weight_t)
 
         bias = wildcard()
-        #NOTE: It does not check data layout
         reshape = is_op("relax.reshape")(bias, wildcard())
-        add = is_op("relax.add")(conv, reshape)
+        bias_t = is_op("relax.permute_dims")(reshape) | reshape
+        add = is_op("relax.add")(conv, bias_t)
+
+        add_t = is_op("relax.permute_dims")(add) | add
         s1 = wildcard()
         z1 = wildcard()
-        output = is_op("relax.quantize")(add, s1, z1)
+        output = is_op("relax.quantize")(add_t, s1, z1)
 
         annotations = {
             "input": x0,
             "scale_in": s0,
             "scale_w": sw,
             "scale_out": s1,
-            "weight": weight,
+            "weight": wi8,
             "conv": conv,
-            "bias": reshape,
-            "root": output,
+            "bias": bias,
         }
         return output, annotations
 
@@ -107,8 +111,9 @@ def conv2d_pattern():
         conv_attrs = annotated_expr["conv"].attrs
         stride = int(conv_attrs.strides[0])
         padding = int(conv_attrs.padding[0])
-        kernel_dim = int(annotated_expr["weight"].args[0].struct_info.shape[2])
+        kernel_dim = int(annotated_expr["weight"].struct_info.shape[2])
         return {
+            "act": "NO_ACTIVATION",
             "acc_scale":  float(scale_in * scale_w / scale_out),
             "stride":     stride,
             "padding":    padding,
@@ -170,20 +175,20 @@ def matmul_softmax_pattern():
         output = is_op("relax.broadcast_to")(softmax, wildcard()) | softmax
 
         annotations = {
-            "input0":    lhs,
-            "input1":    rhs,
-            "matmul":    matmul,
-            "scale_lhs": s0,            # theta int8 input DQ scale
-            "scale_rhs": scale_phi_dq,  # phi   int8 input DQ scale
-            "root":      output,
-            # scale_out = 1.0 (output is float32 softmax; no output Q)
+            "input":    x0,
+            "weight":    input_phi,
+            "scale_in": s0,            # theta int8 input DQ scale
+            "scale_w": scale_phi_dq,  # phi   int8 input DQ scale
+            #"scale_out": 1.0,
+            #"root":      output,
         }
         return output, annotations
 
     def _attrs_getter(annotated_expr):
-        scale_lhs = annotated_expr["scale_lhs"].data.numpy().item()
-        scale_rhs = annotated_expr["scale_rhs"].data.numpy().item()
+        scale_lhs = annotated_expr["scale_in"].data.numpy().item()
+        scale_rhs = annotated_expr["scale_w"].data.numpy().item()
         return {
+            "act": "SOFTMAX",
             "acc_scale": float(scale_lhs * scale_rhs / 1.0),
         }
 
@@ -239,27 +244,26 @@ def matmul_transpose_pattern():
         output = is_op("relax.quantize")(reshape, scale0_q, zp0_q)
 
         annotations = {
-            "input0":    input0,
-            "input1":    input1,
-            "matmul":    matmul,
-            "scale_rhs": scale_g0_dq,  # g-branch int8 input DQ scale
+            "input":    input0,
+            "weight":    input1,
+            #"scale_in": 1.0,
+            "scale_w": scale_g0_dq,  # g-branch int8 input DQ scale
             "scale_out": scale0_q,     # output Q scale
-            "root":      output,
-            # scale_lhs = 1.0 (LHS is float32 softmax output; no input Q)
         }
         return output, annotations
 
     def _attrs_getter(annotated_expr):
-        scale_rhs = annotated_expr["scale_rhs"].data.numpy().item()
+        scale_rhs = annotated_expr["scale_w"].data.numpy().item()
         scale_out = annotated_expr["scale_out"].data.numpy().item()
         return {
+            "act": "SOFTMAX",
             "acc_scale": float(1.0 * scale_rhs / scale_out),
         }
 
     def _check_matmul_transpose_pattern(context: PatternCheckContext) -> bool:
         return _check_gemmini_quantization(context)
 
-    return ("gemmini.matmul", *_make_matmul_transpose_pattern(), _check_matmul_transpose_pattern, _attrs_getter)
+    return ("gemmini.matmul_transpose", *_make_matmul_transpose_pattern(), _check_matmul_transpose_pattern, _attrs_getter)
 
 
 def resadd_leakyrelu_pattern():
@@ -291,20 +295,23 @@ def resadd_leakyrelu_pattern():
 
         annotations = {
             "input0": input0,
-            "scale0": scale0_dq,
-            "zp0": zp0_dq,
             "input1": input1,
-            "scale1": scale1_dq,
-            "zp1": zp1_dq,
-            "add": add,
-            "root": output,
+            "scale_in":  scale0_dq,
+            "scale_w":   scale1_dq,
+            "scale_out": scale2_dq,
+            #"root": output,
         }
         return output, annotations
+
+    def _attrs_getter(annotated_expr):
+        return {
+            "relu": True,
+        }
 
     def _check_resadd_leakyrelu_pattern(context: PatternCheckContext) -> bool:
         return _check_gemmini_quantization(context)
 
-    return ("gemmini.resadd_leakyrelu", *_make_resadd_leakyrelu_pattern(), _check_resadd_leakyrelu_pattern)
+    return ("gemmini.resadd_leakyrelu", *_make_resadd_leakyrelu_pattern(), _check_resadd_leakyrelu_pattern, _attrs_getter)
 
 
 def conv2d_leakyrelu_pattern():
@@ -317,23 +324,28 @@ def conv2d_leakyrelu_pattern():
         scale_dq = wildcard()
         zp_dq = wildcard()
         requant = is_op("relax.dequantize")(input, scale_dq, zp_dq)
+        requant_t = is_op("relax.permute_dims")(requant) | requant
 
         wi8 = wildcard()
         sw = wildcard()
         zpw = wildcard()
         weight = is_op("relax.dequantize")(wi8, sw, zpw)
-        #NOTE: It ignores stride and padding and does not check data layout and out_dtype
-        conv = is_op("relax.nn.conv2d")(requant, weight)
+        # When putting ConvertLayout before FuseOpsByPattern inserts the relax.permute_dims to transpose weights as NHWC that is required by Gemmini from NCHW that is a representation in PyTorch
+        weight_t = is_op("relax.permute_dims")(weight) | weight
+
+        conv = is_op("relax.nn.conv2d")(requant_t, weight_t)
 
         bias = wildcard()
-        #NOTE: It does not check data layout
         bias_reshape = is_op("relax.reshape")(bias, wildcard())
-        add = is_op("relax.add")(conv, bias_reshape)
+        bias_t = is_op("relax.permute_dims")(bias_reshape) | bias_reshape
+        add = is_op("relax.add")(conv, bias_t)
+
+        add_t = is_op("relax.permute_dims")(add) | add
         scale1_q = wildcard()
         zp1_q = wildcard()
         scale1_dq = wildcard()
         zp1_dq = wildcard()
-        q1 = is_op("relax.quantize")(add, scale1_q, zp1_q)
+        q1 = is_op("relax.quantize")(add_t, scale1_q, zp1_q)
         _r = is_op("relax.dequantize")(q1, scale1_dq, zp1_dq)
         act = is_op("relax.nn.leakyrelu")(_r)
         act_reshape = is_op("relax.reshape")(act, wildcard()) | act
@@ -346,9 +358,10 @@ def conv2d_leakyrelu_pattern():
             "scale_in":  scale_dq,
             "scale_w":   sw,
             "scale_out": scale_q,
-            "weight":    weight,
+            "weight":    wi8,
+            "bias":      bias,
             "conv":      conv,
-            "root":      output,
+            #"root":      output,
         }
         return output, annotations
 
@@ -359,11 +372,12 @@ def conv2d_leakyrelu_pattern():
         conv_attrs = annotated_expr["conv"].attrs
         stride = int(conv_attrs.strides[0])
         padding = int(conv_attrs.padding[0])
-        kernel_dim = int(annotated_expr["weight"].args[0].struct_info.shape[2])
+        kernel_dim = int(annotated_expr["weight"].struct_info.shape[2])
         return {
-            "acc_scale":  float(scale_in * scale_w / scale_out),
-            "stride":     stride,
-            "padding":    padding,
+            "act": "RELU",
+            "acc_scale": float(scale_in * scale_w / scale_out),
+            "stride": stride,
+            "padding": padding,
             "kernel_dim": kernel_dim,
         }
 
@@ -411,10 +425,9 @@ def fc_leakyrelu_pattern():
             "scale_in":  scale_dq,
             "scale_w":   sw,
             "scale_out": scale_q,
-            "weight":    weight,
-            "matmul":    matmul,
+            "weight":    wi8,
             "bias":      bias,
-            "root":      output,
+            #"root":      output,
         }
         return output, annotations
 
@@ -423,6 +436,7 @@ def fc_leakyrelu_pattern():
         scale_w = annotated_expr["scale_w"].data.numpy().item()
         scale_out = annotated_expr["scale_out"].data.numpy().item()
         return {
+            "act": "RELU",
             "acc_scale": float(scale_in * scale_w / scale_out),
         }
 
@@ -463,18 +477,18 @@ def fc_pattern():
             "scale_in":  scale_dq,
             "scale_w":   sw,
             "scale_out": scale_q,
-            "weight":    weight,
-            "matmul":    matmul,
+            "weight":    wi8,
             "bias":      bias,
-            "root":      output,
+            #"root":      output,
         }
         return output, annotations
 
     def _attrs_getter(annotated_expr):
-        scale_in  = annotated_expr["scale_in"].data.numpy().item()
-        scale_w   = annotated_expr["scale_w"].data.numpy().item()
+        scale_in = annotated_expr["scale_in"].data.numpy().item()
+        scale_w = annotated_expr["scale_w"].data.numpy().item()
         scale_out = annotated_expr["scale_out"].data.numpy().item()
         return {
+            "act": "NO_ACTIVATION",
             "acc_scale": float(scale_in * scale_w / scale_out),
         }
 

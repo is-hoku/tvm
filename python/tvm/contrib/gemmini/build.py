@@ -14,69 +14,89 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Driver for building Gemmini C code from a Relax module."""
+# pylint: disable=invalid-name, dangerous-default-value, arguments-differ
+# ruff: noqa: F821
+"""Driver for building a Relax module for Gemmini offload."""
 
+import logging
 import os
-import subprocess
 
 from tvm_ffi import register_global_func
 
+import tvm
+
+
+logger = logging.getLogger("gemmini")
+
 
 def has_gemmini():
-    """Returns true if the Gemmini custom codegen is available."""
-    import tvm
+    """Returns true if the Gemmini custom codegen is available"""
     return tvm.get_global_func("relax.ext.gemmini", True) is not None
+
+
+def _get_gemmini_path():
+    invalid_paths = []
+    for rel in ["../../../../", "../../../", "../../"]:
+        tvm_root = os.path.join(os.path.dirname(os.path.realpath(__file__)), rel)
+        gemmini_path = os.path.join(tvm_root, "3rdparty/gemmini")
+        if os.path.exists(gemmini_path):
+            return gemmini_path
+        invalid_paths.append(gemmini_path)
+    raise AssertionError(f"The Gemmini root directory not found in: {invalid_paths}")
+
+
+def _get_gemmini_compile_options():
+    gemmini_root = _get_gemmini_path()
+    gemmini_include = os.path.join(gemmini_root, "include")
+    gemmini_riscv_tests_include = os.path.join(gemmini_root, "riscv-tests")
+    gemmini_riscv_tests_env_include = os.path.join(gemmini_root, "riscv-tests/env")
+    gemmini_riscv_tests_benchmarks_common_include = os.path.join(gemmini_root, "riscv-tests/benchmarks/common")
+
+    kwargs = {}
+    kwargs["cc"] = "riscv64-unknown-linux-gnu-gcc"
+    kwargs["options"] = [
+        "-c",
+        "-DPREALLOCATE=1",
+        "-DMULTITHREAD=1",
+        "-mcmodel=medany",
+        "-std=gnu99",
+        "-O2",
+        "-ffast-math",
+        "-fno-common",
+        "-fno-builtin-printf",
+        "-fno-tree-loop-distribute-patterns",
+        "-march=rv64gc -Wa,-march=rv64gc",
+        "-lm -lgcc",
+        f"-I${gemmini_include}",
+        f"-I${gemmini_riscv_tests_include}",
+        f"-I${gemmini_riscv_tests_env_include}",
+        f"-I${gemmini_riscv_tests_benchmarks_common_include}",
+        "-DPRINT_TILE=0",
+    ]
+    return kwargs
 
 
 @register_global_func("contrib.gemmini.compile")
 def compile_gemmini_module(c_source_module, options):
-    """Write generated Gemmini C code to a file and optionally cross-compile.
+    """Compile all Gemmini kernels in the given C-source module.
 
     Parameters
     ----------
-    c_source_module : runtime.Module
-        A C-source module containing generated Gemmini calls.
-
-    options : dict
-        Compilation options:
-          "out_dir"  : Directory to write generated .c file (default: "./gemmini_out")
-          "cc"       : Cross-compiler to use (default: "riscv64-unknown-elf-gcc")
-          "compile"  : Whether to actually compile (default: False)
-          "gemmini_include" : Path to gemmini include directory
+    c_source_module: runtime.Module
+        A C-source module containing Gemmini kernels.
 
     Returns
     -------
-    c_source_module : runtime.Module
-        The same C-source module (compilation result when compile=True).
+    rt_mod : runtime.Module
+        A runtime module where all gemmini kernels have been compiled.
     """
-    out_dir = options.get("out_dir", "./gemmini_out")
-    cc = options.get("cc", "riscv64-unknown-elf-gcc")
-    do_compile = options.get("compile", False)
+    tmp_dir = options.get("tmp_dir", "./gemmini_out")
 
-    os.makedirs(out_dir, exist_ok=True)
+    function_names = c_source_module.get_function("get_func_names")()
+    compile_options = _get_gemmini_compile_options()
+    lib_path = os.path.join(tmp_dir, "gemmini.o")
+    logger.info("Compiling generated Gemmini code")
+    c_source_module.export_library(lib_path, workspace_dir=tmp_dir, **compile_options)
 
-    src = c_source_module.inspect_source()
-    src_path = os.path.join(out_dir, "gemmini_model.c")
-    with open(src_path, "w") as f:
-        f.write(src)
-    print(f"[Gemmini] Generated C code written to: {src_path}")
-
-    if do_compile:
-        gemmini_include = options.get("gemmini_include", ".")
-        obj_path = os.path.join(out_dir, "gemmini_model.o")
-        cmd = [
-            cc,
-            "-O2",
-            f"-I{gemmini_include}",
-            "-c", src_path,
-            "-o", obj_path,
-        ]
-        print(f"[Gemmini] Compiling: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Gemmini compilation failed:\n{result.stderr}"
-            )
-        print(f"[Gemmini] Compiled to: {obj_path}")
-
-    return c_source_module
+    # Recover static library
+    return tvm.runtime.load_static_library(lib_path, function_names)

@@ -751,6 +751,21 @@ def FoldRedundantBroadcastTo() -> tvm.ir.transform.Pass:
     return _ffi_api.FoldRedundantBroadcastTo()  # type: ignore
 
 
+def FoldPermuteDims() -> tvm.ir.transform.Pass:
+    """Fold permute_dims ops for transposition from NCHW to NHWC.
+
+    lv: relax.dequantize(weight, ...)
+    lv1: relax.permute_dims(lv, axes=[0, 2, 3, 1])
+    ↓
+    lv1: relax.dequantize(transposed_weight_const, ...)
+
+    Returns
+    -------
+    ret: tvm.ir.transform.Pass
+    """
+    return _ffi_api.FoldPermuteDims()  # type: ignore
+
+
 def ExpandTupleArguments() -> tvm.ir.transform.Pass:
     """Expand tuple arguments to internal functions
 

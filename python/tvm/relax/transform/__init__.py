@@ -43,6 +43,7 @@ from .transform import (
     ExpandTupleArguments,
     FoldConstant,
     FoldRedundantBroadcastTo,
+    FoldPermuteDims,
     FunctionPass,
     FuseOps,
     FuseOpsByPattern,
