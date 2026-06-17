@@ -295,7 +295,7 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
     //                int pool_stride, int pool_padding,
 
     //                enum tiled_matmul_type_t tiled_conv_type) {
-	  ss << "tiled_conv2d_auto("
+	  ss << "tiled_conv_auto("
 		 << batch_size << ", "
 		 << in_rows << ", "
 		 << in_cols << ", "
@@ -388,7 +388,7 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 		 << "0, " // bert_scale
 		 << "false, false, "
 		 << transpose_B << ", "
-		 << "false, false, false, 0, "
+		 << "false, false, 0, "
 		 << "WS);";
 
 	  return ss.str();
@@ -430,9 +430,9 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 	  ss << "tiled_resadd_auto("
 		 << I << ", "
 		 << J << ", "
-		 << A_scale << ", "
-		 << B_scale << ", "
-		 << C_scale << ", "
+		 << "*" << A_scale << ", "
+		 << "*" << B_scale << ", "
+		 << "*" << C_scale << ", "
 	  	 << "(elem_t*)" << func_args[i0_idx] << ", "
 	  	 << "(elem_t*)" << func_args[i1_idx] << ", "
 		 << "(elem_t*)" << out << ", "
