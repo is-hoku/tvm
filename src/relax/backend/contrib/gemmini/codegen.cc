@@ -29,7 +29,7 @@
 #include <tvm/relax/type.h>
 #include <tvm/runtime/module.h>
 
-#include <memory>
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 #include <vector>

@@ -94,6 +94,7 @@ def compile_gemmini_module(c_source_module, options):
         A runtime module where all gemmini kernels have been compiled.
     """
     tmp_dir = options.get("tmp_dir", "./gemmini_out")
+    os.makedirs(tmp_dir, exist_ok=True)
 
     function_names = c_source_module.get_function("get_func_names")()
     compile_options = _get_gemmini_compile_options()
