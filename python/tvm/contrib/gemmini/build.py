@@ -45,6 +45,14 @@ def _get_gemmini_path():
     raise AssertionError(f"The Gemmini root directory not found in: {invalid_paths}")
 
 
+def _get_tvm_root():
+    for rel in ["../../../../", "../../../", "../../"]:
+        tvm_root = os.path.join(os.path.dirname(os.path.realpath(__file__)), rel)
+        if os.path.exists(os.path.join(tvm_root, "3rdparty/tvm-ffi/include")):
+            return os.path.realpath(tvm_root)
+    raise AssertionError("TVM root not found")
+
+
 def _get_gemmini_compile_options():
     gemmini_root = _get_gemmini_path()
     gemmini_include = os.path.join(gemmini_root, "include")
@@ -52,14 +60,18 @@ def _get_gemmini_compile_options():
     gemmini_riscv_tests_env_include = os.path.join(gemmini_root, "riscv-tests/env")
     gemmini_riscv_tests_benchmarks_common_include = os.path.join(gemmini_root, "riscv-tests/benchmarks/common")
 
+    tvm_root = _get_tvm_root()
+    tvm_ffi_include = os.path.join(tvm_root, "3rdparty/tvm-ffi/include")
+    dlpack_include = os.path.join(tvm_root, "3rdparty/tvm-ffi/3rdparty/dlpack/include")
+
     kwargs = {}
-    kwargs["cc"] = "riscv64-unknown-linux-gnu-gcc"
+    kwargs["cc"] = "riscv64-unknown-linux-gnu-g++"
     kwargs["options"] = [
         "-c",
         "-DPREALLOCATE=1",
         "-DMULTITHREAD=1",
         "-mcmodel=medany",
-        "-std=gnu99",
+        "-std=gnu++17",
         "-O2",
         "-ffast-math",
         "-fno-common",
@@ -69,6 +81,8 @@ def _get_gemmini_compile_options():
         "-Wa,-march=rv64gc",
         "-lm",
         "-lgcc",
+        f"-I{tvm_ffi_include}",
+        f"-I{dlpack_include}",
         f"-I{gemmini_root}",
         f"-I{gemmini_include}",
         f"-I{gemmini_riscv_tests_include}",

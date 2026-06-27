@@ -8,9 +8,10 @@
       -I 3rdparty/tvm-ffi/3rdparty/dlpack/include \
       apps/braggnn_gemmini/inference.cc \
       -o apps/braggnn_gemmini/inference \
-      -L build_riscv \
-      -L build_riscv/lib \
-      -ltvm_runtime \
-      -ltvm_ffi \
-      -lm -lstdc++ -lgcc \
-      -Wl,-rpath,'$ORIGIN'
+      -Wl,--whole-archive \
+        build_riscv/libtvm_runtime.a \
+        build_riscv/lib/libtvm_ffi_static.a \
+      -Wl,--no-whole-archive \
+      build_riscv/3rdparty/tvm-ffi/libbacktrace/lib/libbacktrace.a \
+      -static-libstdc++ -static-libgcc \
+      -lm -ldl -lpthread

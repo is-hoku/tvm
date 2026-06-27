@@ -41,13 +41,28 @@ namespace tvm {
 namespace relax {
 namespace contrib {
 
+std::string EmitSignature(const std::vector<Output>& out, const std::string& func_id,
+                          const std::vector<std::string>& arg_names) {
+  std::ostringstream code_stream_;
+  code_stream_ << "void " << func_id << "_(";
+  for (const auto& arg_name : arg_names) {
+    code_stream_ << "DLTensor* " << arg_name << ", ";
+  }
+  for (size_t i = 0; i < out.size() - 1; ++i) {
+    code_stream_ << "DLTensor* out" << i << ", ";
+  }
+  code_stream_ << "DLTensor* out" << out.size() - 1 << ")";
+  return code_stream_.str();
+}
+
 ffi::Module Finalize(const std::string& code, const ffi::Array<ffi::String>& func_names) {
   TVM_FFI_ICHECK(!func_names.empty())
       << "Should only create Gemmini CSourceModule if there is at least one Gemmini partition";
 
   std::ostringstream default_headers;
-  //default_headers << "#include <tvm/ffi/function.h>\n";
-  //default_headers << "#include <dlpack/dlpack.h>\n";
+  default_headers << "#include <tvm/ffi/c_api.h>\n";
+  default_headers << "#include <tvm/ffi/function.h>\n";
+  default_headers << "#include <dlpack/dlpack.h>\n";
   default_headers << "#include <assert.h>\n";
   default_headers << "#include <stddef.h>\n";
   default_headers << "#include <stdint.h>\n";
@@ -56,8 +71,10 @@ ffi::Module Finalize(const std::string& code, const ffi::Array<ffi::String>& fun
   default_headers << "#ifndef BAREMETAL\n";
   default_headers << "#include <sys/mman.h>\n";
   default_headers << "#endif\n";
+  default_headers << "extern \"C\" {\n";
   default_headers << "#include \"include/gemmini_params.h\"\n";
   default_headers << "#include \"include/gemmini.h\"\n";
+  default_headers << "}\n";
 
   const auto pf = tvm::ffi::Function::GetGlobalRequired("runtime.CSourceModuleCreate");
   VLOG(1) << "Generated Gemmini code:" << std::endl << code;
@@ -83,19 +100,51 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
   }
 
   std::string JIT(const OutputType& out) final {
-    code_stream_ << "void " << ext_func_id_ << "_(";
+	// Generate C source that use raw pointers without wrapping by DLTensor
 
+    //code_stream_ << "void " << ext_func_id_ << "_(";
+
+    //for (const auto& arg : ext_func_args_) {
+    //  const auto& dtype_str = GetDtypeString(arg);
+    //  code_stream_ << dtype_str << "* " << arg->name_hint() << ", ";
+    //}
+    //for (size_t i = 0; i < out.size() - 1; ++i) {
+    //  code_stream_ << out[i].dtype << "* out" << i << ", ";
+    //}
+    //code_stream_ << out.back().dtype << "* out" << out.size() - 1 << ") {\n";
+    //this->EnterScope();
+
+    //// Function body
+    //for (auto decl : buf_decl_) {
+    //  this->PrintIndents();
+    //  code_stream_ << decl << "\n";
+    //}
+    //code_stream_ << "\n";
+    //for (auto stmt : ext_func_body_) {
+    //  this->PrintIndents();
+    //  code_stream_ << stmt << "\n";
+    //}
+
+    //this->ExitScope();
+    //code_stream_ << "}\n";
+
+    //std::vector<std::string> arg_types;
+    //for (const auto& arg : ext_func_args_) {
+    //  arg_types.push_back(GetDtypeString(arg));
+    //}
+
+    //GenerateBackendCFunc(ext_func_id_, arg_types, "", out, /*pass_dl_tensor=*/false);
+    //return code_stream_.str();
+
+
+    std::vector<std::string> arg_names;
     for (const auto& arg : ext_func_args_) {
-      const auto& dtype_str = GetDtypeString(arg);
-      code_stream_ << dtype_str << "* " << arg->name_hint() << ", ";
+      arg_names.push_back(var_name_map_.at(arg.get()));
     }
-    for (size_t i = 0; i < out.size() - 1; ++i) {
-      code_stream_ << out[i].dtype << "* out" << i << ", ";
-    }
-    code_stream_ << out.back().dtype << "* out" << out.size() - 1 << ") {\n";
-    this->EnterScope();
 
-    // Function body
+    // Emit compute function: void func_id_(DLTensor* arg0, ..., DLTensor* out0)
+    code_stream_ << EmitSignature(out, ext_func_id_, arg_names) << "{\n";
+    this->EnterScope();
     for (auto decl : buf_decl_) {
       this->PrintIndents();
       code_stream_ << decl << "\n";
@@ -105,9 +154,34 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
       this->PrintIndents();
       code_stream_ << stmt << "\n";
     }
-
     this->ExitScope();
     code_stream_ << "}\n";
+
+    // Emit TVM FFI ABI export following compiler_integration.md:
+    // - symbol must be __tvm_ffi_<name>
+    // - signature: (void* handle, const TVMFFIAny* args, int32_t num_args, TVMFFIAny* result)
+    // - DLTensor extracted via args[i].v_ptr
+    code_stream_ << "\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
+    code_stream_ << "TVM_FFI_DLL_EXPORT int __tvm_ffi_" << ext_func_id_ << "(\n";
+    code_stream_ << "    void* handle, const TVMFFIAny* args,\n";
+    code_stream_ << "    int32_t num_args, TVMFFIAny* result) {\n";
+    for (size_t i = 0; i < arg_names.size(); i++) {
+      code_stream_ << "  DLTensor* arg" << i << " = (DLTensor*)(args[" << i << "].v_ptr);\n";
+    }
+    for (size_t i = 0; i < out.size(); i++) {
+      code_stream_ << "  DLTensor* out" << i << " = (DLTensor*)(args["
+                   << (arg_names.size() + i) << "].v_ptr);\n";
+    }
+    code_stream_ << "  " << ext_func_id_ << "_(";
+    for (size_t i = 0; i < arg_names.size(); i++) {
+      code_stream_ << "arg" << i << ", ";
+    }
+    for (size_t i = 0; i < out.size() - 1; i++) {
+      code_stream_ << "out" << i << ", ";
+    }
+    code_stream_ << "out" << out.size() - 1 << ");\n";
+    code_stream_ << "  return 0;\n}\n";
+    code_stream_ << "#ifdef __cplusplus\n}\n#endif\n";
 
     return code_stream_.str();
   }
@@ -309,10 +383,10 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 		 << padding << ", "
 		 << kernel_dim << ", "
 		 << "false, false, false, false, false, "
-	  	 << "(elem_t*)" << func_args[i_idx] << ", "
-	  	 << "(elem_t*)" << func_args[w_idx] << ", "
-	  	 << "(acc_t*)" << func_args[b_idx] << ", "
-	  	 << "(elem_t*)" << out << ", "
+	  	 << "(elem_t*)(" << func_args[i_idx] << "->data), "
+	  	 << "(elem_t*)(" << func_args[w_idx] << "->data), "
+	  	 << "(acc_t*)(" << func_args[b_idx] << "->data), "
+	  	 << "(elem_t*)(" << out << "->data), "
 		 << act << ", "
 		 << acc_scale << ", "
 		 << "0, 0, 0, "
@@ -340,7 +414,9 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 
 	  std::string bias = "NULL";
 	  if (arg_idx.count("bias")) {
-		  bias = func_args[arg_idx["bias"]->value];
+		  // Extract raw data pointer from DLTensor so tiled_matmul_auto
+		  // receives a plain void* pointing to the bias values.
+		  bias = "(acc_t*)(" + std::string(func_args[arg_idx["bias"]->value]) + "->data)";
 	  }
 
 	  // NCHW
@@ -374,10 +450,10 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 		 << dim_I << ", "
 		 << dim_J << ", "
 		 << dim_K << ", "
-		 << "(elem_t*)" << func_args[in_idx] << ", "
-		 << "(elem_t*)" << func_args[w_idx] << ", "
+		 << "(elem_t*)(" << func_args[in_idx] << "->data), "
+		 << "(elem_t*)(" << func_args[w_idx] << "->data), "
 		 << bias << ", "
-		 << "(elem_t*)" << out << ", "
+		 << "(elem_t*)(" << out << "->data), "
 		 << stride_A << ", " // stride_A
 		 << stride_B << ", " // stride_B
 		 << stride_D << ", " // stride_D
@@ -392,7 +468,6 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 		 << "WS);";
 
 	  return ss.str();
-	  return "tiled_matmul_auto()";
   }
 
   std::string EmitGemminiResadd(const CallNode* call, const Function& func, const std::string& out, const std::string func_name) {
@@ -414,9 +489,12 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 
 	  int64_t I = i0_shape[2];
 	  int64_t J = i0_shape[3];
-	  std::string A_scale = func_args[arg_idx["scale_in"]->value];
-	  std::string B_scale = func_args[arg_idx["scale_w"]->value];
-	  std::string C_scale = func_args[arg_idx["scale_out"]->value];
+	  //std::string A_scale = func_args[arg_idx["scale_in"]->value];
+	  //std::string B_scale = func_args[arg_idx["scale_w"]->value];
+	  //std::string C_scale = func_args[arg_idx["scale_out"]->value];
+	  int64_t A_scale = arg_idx["scale_in"]->value;
+	  int64_t B_scale = arg_idx["scale_w"]->value;
+	  int64_t C_scale = arg_idx["scale_out"]->value;
 
 	  bool relu = attrs.at("relu").try_cast<bool>().value();
 
@@ -427,15 +505,21 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 //	                               const acc_scale_t C_scale, const elem_t *A,
 //	                               const elem_t *B, elem_t *C, bool relu,
 //	                               enum tiled_matmul_type_t matadd_type) {
+	  // The inner function receives DLTensor* pointers.  For scalar scale
+	  // parameters we extract the first element of the underlying data array;
+	  // for tensor pointers we extract ->data so Gemmini sees plain elem_t*.
 	  ss << "tiled_resadd_auto("
 		 << I << ", "
 		 << J << ", "
-		 << "*" << A_scale << ", "
-		 << "*" << B_scale << ", "
-		 << "*" << C_scale << ", "
-	  	 << "(elem_t*)" << func_args[i0_idx] << ", "
-	  	 << "(elem_t*)" << func_args[i1_idx] << ", "
-		 << "(elem_t*)" << out << ", "
+		 //<< "((scale_t*)(" << A_scale << "->data))[0], "
+		 //<< "((scale_t*)(" << B_scale << "->data))[0], "
+		 //<< "((acc_scale_t*)(" << C_scale << "->data))[0], "
+		 <<  A_scale << ", "
+		 <<  B_scale << ", "
+		 <<  C_scale << ", "
+	  	 << "(elem_t*)(" << func_args[i0_idx] << "->data), "
+	  	 << "(elem_t*)(" << func_args[i1_idx] << "->data), "
+		 << "(elem_t*)(" << out << "->data), "
 		 << relu << ", "
 		 << "WS);";
 
