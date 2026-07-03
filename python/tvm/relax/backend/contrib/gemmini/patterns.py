@@ -23,6 +23,7 @@ from typing import ClassVar
 from tvm import TVMError
 from tvm.ir import Op
 from tvm.relax.dpl.pattern import is_op, wildcard
+from tvm.relax.expr import Var
 from tvm.relax.transform import PatternCheckContext
 
 from ...pattern_registry import register_patterns
@@ -256,7 +257,7 @@ def matmul_transpose_pattern():
         scale_rhs = annotated_expr["scale_w"].data.numpy().item()
         scale_out = annotated_expr["scale_out"].data.numpy().item()
         return {
-            "act": "SOFTMAX",
+            "act": "NO_ACTIVATION",
             "acc_scale": float(1.0 * scale_rhs / scale_out),
         }
 
@@ -296,15 +297,23 @@ def resadd_leakyrelu_pattern():
         annotations = {
             "input0": input0,
             "input1": input1,
-            "scale_in":  scale0_dq,
-            "scale_w":   scale1_dq,
-            "scale_out": scale2_dq,
+            "scale0_dq": scale0_dq,
+            "scale2_q": scale2_q,
+            "scale1_dq": scale1_dq,
+            "scale0_q": scale0_q,
             #"root": output,
         }
         return output, annotations
 
     def _attrs_getter(annotated_expr):
+        scale0_dq = annotated_expr["scale0_dq"].data.numpy().item()
+        scale2_q = annotated_expr["scale2_q"].data.numpy().item()
+        scale1_dq = annotated_expr["scale1_dq"].data.numpy().item()
+        scale0_q = annotated_expr["scale0_q"].data.numpy().item()
         return {
+            "scale_in":  scale0_dq / scale2_q,
+            "scale_w":   scale1_dq / scale2_q,
+            "scale_out": scale2_q / scale0_q,
             "relu": True,
         }
 

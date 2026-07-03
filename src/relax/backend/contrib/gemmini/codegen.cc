@@ -76,6 +76,13 @@ ffi::Module Finalize(const std::string& code, const ffi::Array<ffi::String>& fun
   default_headers << "#include \"include/gemmini.h\"\n";
   default_headers << "}\n";
 
+  default_headers << "static inline DLTensor* GEMMINI_READ_TENSOR(const TVMFFIAny* v) {\n";
+  default_headers << "  if (v->type_index == kTVMFFIDLTensorPtr) return (DLTensor*)(v->v_ptr);\n";
+  default_headers << "  return (DLTensor*)((char*)(v->v_obj) + sizeof(TVMFFIObject));\n";
+  default_headers << "}\n";
+  // GEMMINI_DATA folds the offset into a byte pointer for casting.
+  default_headers << "#define GEMMINI_DATA(t) ((void*)((char*)((t)->data) + (t)->byte_offset))\n";
+
   const auto pf = tvm::ffi::Function::GetGlobalRequired("runtime.CSourceModuleCreate");
   VLOG(1) << "Generated Gemmini code:" << std::endl << code;
   return pf(default_headers.str() + code, "c", func_names,
@@ -142,7 +149,6 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
       arg_names.push_back(var_name_map_.at(arg.get()));
     }
 
-    // Emit compute function: void func_id_(DLTensor* arg0, ..., DLTensor* out0)
     code_stream_ << EmitSignature(out, ext_func_id_, arg_names) << "{\n";
     this->EnterScope();
     for (auto decl : buf_decl_) {
@@ -157,20 +163,16 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
     this->ExitScope();
     code_stream_ << "}\n";
 
-    // Emit TVM FFI ABI export following compiler_integration.md:
-    // - symbol must be __tvm_ffi_<name>
-    // - signature: (void* handle, const TVMFFIAny* args, int32_t num_args, TVMFFIAny* result)
-    // - DLTensor extracted via args[i].v_ptr
     code_stream_ << "\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
     code_stream_ << "TVM_FFI_DLL_EXPORT int __tvm_ffi_" << ext_func_id_ << "(\n";
     code_stream_ << "    void* handle, const TVMFFIAny* args,\n";
     code_stream_ << "    int32_t num_args, TVMFFIAny* result) {\n";
     for (size_t i = 0; i < arg_names.size(); i++) {
-      code_stream_ << "  DLTensor* arg" << i << " = (DLTensor*)(args[" << i << "].v_ptr);\n";
+      code_stream_ << "  DLTensor* arg" << i << " = GEMMINI_READ_TENSOR(&args[" << i << "]);\n";
     }
     for (size_t i = 0; i < out.size(); i++) {
-      code_stream_ << "  DLTensor* out" << i << " = (DLTensor*)(args["
-                   << (arg_names.size() + i) << "].v_ptr);\n";
+      code_stream_ << "  DLTensor* out" << i << " = GEMMINI_READ_TENSOR(&args["
+                   << (arg_names.size() + i) << "]);\n";
     }
     code_stream_ << "  " << ext_func_id_ << "_(";
     for (size_t i = 0; i < arg_names.size(); i++) {
@@ -325,22 +327,16 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 	  int64_t w_idx = arg_idx["weight"]->value;
 	  int64_t b_idx = arg_idx["bias"]->value;
 
-	  // NCHW
 	  const auto* in_sinfo = GetStructInfo(func->params[i_idx]).as<TensorStructInfoNode>();
 	  auto in_shape = backend::GetIntShape(in_sinfo->shape.value().as<ShapeExprNode>()->values);
 
-	  // OHWI
 	  const auto* w_sinfo = GetStructInfo(func->params[w_idx]).as<TensorStructInfoNode>();
 	  auto w_shape = backend::GetIntShape(w_sinfo->shape.value().as<ShapeExprNode>()->values);
 
-	  // NCHW
-	  //auto* out_sinfo = GetStructInfo(ffi::GetRef<Call>(call)).as<TensorStructInfoNode>();
-	  //auto out_shape = backend::GetIntShape(out_sinfo->shape.value().as<ShapeExprNode>()->values);
-
-	  int64_t batch_size = in_shape[0];
-	  int64_t in_rows = in_shape[2];
-	  int64_t in_cols = in_shape[3];
-	  int64_t in_channels = in_shape[1];
+	  int64_t batch_size   = in_shape[0];
+	  int64_t in_channels  = in_shape[1];
+	  int64_t in_rows      = in_shape[2];
+	  int64_t in_cols      = in_shape[3];
 	  int64_t out_channels = w_shape[0];
 
 	  std::string act = attrs.at("act").try_cast<std::string>().value();
@@ -383,14 +379,17 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 		 << padding << ", "
 		 << kernel_dim << ", "
 		 << "false, false, false, false, false, "
-	  	 << "(elem_t*)(" << func_args[i_idx] << "->data), "
-	  	 << "(elem_t*)(" << func_args[w_idx] << "->data), "
-	  	 << "(acc_t*)(" << func_args[b_idx] << "->data), "
-	  	 << "(elem_t*)(" << out << "->data), "
+	  	 << "(elem_t*)GEMMINI_DATA(" << func_args[i_idx] << "), "
+	  	 << "(elem_t*)GEMMINI_DATA(" << func_args[w_idx] << "), "
+	  	 << "(acc_t*)GEMMINI_DATA(" << func_args[b_idx] << "), "
+	  	 << "(elem_t*)GEMMINI_DATA(" << out << "), "
 		 << act << ", "
 		 << acc_scale << ", "
 		 << "0, 0, 0, "
-		 << "WS);";
+		 << "WS);\n"
+		 // tiled_conv_auto does NOT fence internally unlike tiled_matmul_auto /
+		 // tiled_resadd_auto, which fence on exit.
+		 << "  gemmini_fence();";
 
 	  return ss.str();
   }
@@ -404,22 +403,17 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 	  int64_t in_idx = arg_idx["input"]->value;
 	  int64_t w_idx = arg_idx["weight"]->value;
 
-	  // NCHW
 	  const auto* in_sinfo = GetStructInfo(func->params[in_idx]).as<TensorStructInfoNode>();
 	  auto in_shape = backend::GetIntShape(in_sinfo->shape.value().as<ShapeExprNode>()->values);
 
-	  // NCHW
 	  const auto* w_sinfo = GetStructInfo(func->params[w_idx]).as<TensorStructInfoNode>();
 	  auto w_shape = backend::GetIntShape(w_sinfo->shape.value().as<ShapeExprNode>()->values);
 
 	  std::string bias = "NULL";
 	  if (arg_idx.count("bias")) {
-		  // Extract raw data pointer from DLTensor so tiled_matmul_auto
-		  // receives a plain void* pointing to the bias values.
-		  bias = "(acc_t*)(" + std::string(func_args[arg_idx["bias"]->value]) + "->data)";
+		  bias = "(acc_t*)GEMMINI_DATA(" + std::string(func_args[arg_idx["bias"]->value]) + ")";
 	  }
 
-	  // NCHW
 	  //auto* out_sinfo = GetStructInfo(ffi::GetRef<Call>(call)).as<TensorStructInfoNode>();
 	  //auto out_shape = backend::GetIntShape(out_sinfo->shape.value().as<ShapeExprNode>()->values);
 
@@ -429,7 +423,7 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 	  int64_t dim_K = in_shape.back();
 	  bool transpose_B = (in_shape[in_shape.size() - 1] != w_shape[w_shape.size() - 2] ? true : false);
 	  int64_t stride_A = dim_K;
-	  int64_t stride_B = in_shape.back();
+	  int64_t stride_B = w_shape.back();
 	  int64_t stride_C = dim_J;
 	  int64_t stride_D = dim_J;
 
@@ -450,10 +444,10 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 		 << dim_I << ", "
 		 << dim_J << ", "
 		 << dim_K << ", "
-		 << "(elem_t*)(" << func_args[in_idx] << "->data), "
-		 << "(elem_t*)(" << func_args[w_idx] << "->data), "
+		 << "(elem_t*)GEMMINI_DATA(" << func_args[in_idx] << "), "
+		 << "(elem_t*)GEMMINI_DATA(" << func_args[w_idx] << "), "
 		 << bias << ", "
-		 << "(elem_t*)(" << out << "->data), "
+		 << "(elem_t*)GEMMINI_DATA(" << out << "), "
 		 << stride_A << ", " // stride_A
 		 << stride_B << ", " // stride_B
 		 << stride_D << ", " // stride_D
@@ -479,23 +473,21 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 	  int64_t i0_idx = arg_idx["input0"]->value;
 	  int64_t i1_idx = arg_idx["input1"]->value;
 
-	  // NCHW
 	  const auto* i0_sinfo = GetStructInfo(func->params[i0_idx]).as<TensorStructInfoNode>();
 	  auto i0_shape = backend::GetIntShape(i0_sinfo->shape.value().as<ShapeExprNode>()->values);
 
-	  // NCHW
 	  const auto* i1_sinfo = GetStructInfo(func->params[i1_idx]).as<TensorStructInfoNode>();
 	  auto i1_shape = backend::GetIntShape(i1_sinfo->shape.value().as<ShapeExprNode>()->values);
 
-	  int64_t I = i0_shape[2];
-	  int64_t J = i0_shape[3];
-	  //std::string A_scale = func_args[arg_idx["scale_in"]->value];
-	  //std::string B_scale = func_args[arg_idx["scale_w"]->value];
-	  //std::string C_scale = func_args[arg_idx["scale_out"]->value];
-	  int64_t A_scale = arg_idx["scale_in"]->value;
-	  int64_t B_scale = arg_idx["scale_w"]->value;
-	  int64_t C_scale = arg_idx["scale_out"]->value;
+	  int64_t I = i0_shape[0] * i0_shape[2] * i0_shape[3];
+	  int64_t J = i0_shape[1];
+	  //int64_t A_scale_idx = arg_idx["scale_in"]->value;
+	  //int64_t B_scale_idx = arg_idx["scale_w"]->value;
+	  //int64_t C_scale_idx = arg_idx["scale_out"]->value;
 
+	  double A_scale = attrs.at("scale_in").try_cast<double>().value();
+	  double B_scale = attrs.at("scale_w").try_cast<double>().value();
+	  double C_scale = attrs.at("scale_out").try_cast<double>().value();
 	  bool relu = attrs.at("relu").try_cast<bool>().value();
 
 	  std::ostringstream ss;
@@ -505,21 +497,18 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 //	                               const acc_scale_t C_scale, const elem_t *A,
 //	                               const elem_t *B, elem_t *C, bool relu,
 //	                               enum tiled_matmul_type_t matadd_type) {
-	  // The inner function receives DLTensor* pointers.  For scalar scale
-	  // parameters we extract the first element of the underlying data array;
-	  // for tensor pointers we extract ->data so Gemmini sees plain elem_t*.
 	  ss << "tiled_resadd_auto("
 		 << I << ", "
 		 << J << ", "
-		 //<< "((scale_t*)(" << A_scale << "->data))[0], "
-		 //<< "((scale_t*)(" << B_scale << "->data))[0], "
-		 //<< "((acc_scale_t*)(" << C_scale << "->data))[0], "
-		 <<  A_scale << ", "
-		 <<  B_scale << ", "
-		 <<  C_scale << ", "
-	  	 << "(elem_t*)(" << func_args[i0_idx] << "->data), "
-	  	 << "(elem_t*)(" << func_args[i1_idx] << "->data), "
-		 << "(elem_t*)(" << out << "->data), "
+		 << A_scale << ", "
+		 << B_scale << ", "
+		 << C_scale << ", "
+		 //<< "((scale_t*)GEMMINI_DATA(" << func_args[A_scale_idx] << "))[0], "
+		 //<< "((scale_t*)GEMMINI_DATA(" << func_args[B_scale_idx] << "))[0], "
+		 //<< "(1.0f / ((acc_scale_t*)GEMMINI_DATA(" << func_args[C_scale_idx] << "))[0]), "
+	  	 << "(elem_t*)GEMMINI_DATA(" << func_args[i0_idx] << "), "
+	  	 << "(elem_t*)GEMMINI_DATA(" << func_args[i1_idx] << "), "
+		 << "(elem_t*)GEMMINI_DATA(" << out << "), "
 		 << relu << ", "
 		 << "WS);";
 

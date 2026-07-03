@@ -4,6 +4,7 @@
       -O2 -ffast-math -fno-common -fno-builtin-printf \
       -fno-tree-loop-distribute-patterns \
       -I include \
+	  -I 3rdparty/gemmini \
       -I 3rdparty/tvm-ffi/include \
       -I 3rdparty/tvm-ffi/3rdparty/dlpack/include \
       apps/braggnn_gemmini/inference.cc \

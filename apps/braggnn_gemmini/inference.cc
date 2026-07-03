@@ -1,11 +1,14 @@
 #include <tvm/runtime/vm/executable.h>
 #include <tvm/runtime/vm/vm.h>
 
+#include <include/gemmini_params.h>
+#include <include/gemmini.h>
+
 #include <cstdio>
 
 static inline unsigned long long read_cycles() {
-  unsigned long long cycles;
-  asm volatile("csrr %0, cycle" : "=r"(cycles));
+  uint64_t cycles;
+  asm volatile ("rdcycle %0" : "=r" (cycles));
   return cycles;
 }
 
@@ -66,7 +69,7 @@ int main(int argc, char* argv[]){
 					   static_cast<int>(kDLCPU), 0,
                        static_cast<int>(tvm::runtime::AllocatorType::kPooled));
 
-  tvm::ffi::Tensor input = tvm::ffi::Tensor::FromNDAlloc(CPUAllocator(), {1, 1, 11, 11}, DLDataType{kDLFloat, 32, 1}, dev);
+  tvm::ffi::Tensor input = tvm::ffi::Tensor::FromNDAlloc(CPUAllocator(), {1, 11, 11, 1}, DLDataType{kDLFloat, 32, 1}, dev);
   std::memcpy(input.data_ptr(), kPatch0, sizeof(kPatch0));
 
   tvm::ffi::Function main_func = mod->GetFunction("main").value();
@@ -74,9 +77,11 @@ int main(int argc, char* argv[]){
   printf("==============================================\n");
   printf("BraggNN Gemmini through TVM Relax VM\n");
   printf("==============================================\n");
-  printf("\nInput shape: [1, 1, 11, 11]\n");
+  printf("\nInput shape: [1, 11, 11, 1]\n");
   printf("Running %d inferences (%d warmup + %d measured)\n",
          NUM_ITERS + 1, 1, NUM_ITERS);
+
+  gemmini_flush(0);
 
   // Warmup: drop first run to warm caches
   printf("\n--- Warmup ---\n");
