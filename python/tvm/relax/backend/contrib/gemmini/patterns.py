@@ -65,7 +65,7 @@ def _check_gemmini_quantization(
 
 def conv2d_pattern():
     """
-    input -> DQ, weight -> DQ -> conv2d(input, weight), bias -> reshape -> add(conv2d, reshape) -> Q
+    input -> DQ, weight -> DQ -> conv2d(input, weight), bias -> DQ -> reshape -> add(conv2d, reshape) -> Q
     """
 
     def _make_conv2d_pattern():
@@ -85,7 +85,10 @@ def conv2d_pattern():
         conv = is_op("relax.nn.conv2d")(d_t, weight_t)
 
         bias = wildcard()
-        reshape = is_op("relax.reshape")(bias, wildcard())
+        sb = wildcard()
+        zb = wildcard()
+        bias_d = is_op("relax.dequantize")(bias, sb, zb)
+        reshape = is_op("relax.reshape")(bias_d, wildcard())
         bias_t = is_op("relax.permute_dims")(reshape) | reshape
         add = is_op("relax.add")(conv, bias_t)
 
@@ -112,7 +115,7 @@ def conv2d_pattern():
         conv_attrs = annotated_expr["conv"].attrs
         stride = int(conv_attrs.strides[0])
         padding = int(conv_attrs.padding[0])
-        kernel_dim = int(annotated_expr["weight"].struct_info.shape[2])
+        kernel_dim = int(annotated_expr["weight"].struct_info.shape[0])
         return {
             "act": "NO_ACTIVATION",
             "acc_scale":  float(scale_in * scale_w / scale_out),
@@ -129,33 +132,38 @@ def conv2d_pattern():
     return ("gemmini.conv2d", *_make_conv2d_pattern(), _check_conv2d_pattern, _attrs_getter)
 
 
-def matmul_softmax_pattern():
+def matmul_self_attention_pattern():
     """
     LHS (theta): int8 -> DQ -> reshape -> Q -> DQ -> permute_dims -> Q -> DQ -> broadcast_to
     RHS (phi):   int8 -> DQ -> reshape -> Q -> DQ -> broadcast_to
     matmul(LHS, RHS) -> softmax -> broadcast_to  (NO QUANTIZE at output)
+
+    LHS (from phi): wildcard (softmax)
+    RHS (g): int8_input -> DQ -> reshape -> Q -> DQ -> permute_dims -> Q -> DQ
+    matmul(wildcard, DQ) -> permute_dims -> reshape -> Q
     """
 
-    def _make_matmul_softmax_pattern():
-        x0 = wildcard()
-        s0 = wildcard()
-        z0 = wildcard()
-        d = is_op("relax.dequantize")(x0, s0, z0)
-        reshape = is_op("relax.reshape")(d, wildcard())
+    def _make_matmul_self_attention_pattern():
+        # LHS: theta branch
+        input_theta = wildcard()
+        scale_theta_dq = wildcard()
+        zp_theta_dq = wildcard()
+        dq_theta = is_op("relax.dequantize")(input_theta, scale_theta_dq, zp_theta_dq)
+        reshape_theta = is_op("relax.reshape")(dq_theta, wildcard())
         s2 = wildcard()
         z2 = wildcard()
-        q1 = is_op("relax.quantize")(reshape, s2, z2)
+        q1 = is_op("relax.quantize")(reshape_theta, s2, z2)
         s3 = wildcard()
         z3 = wildcard()
         d1 = is_op("relax.dequantize")(q1, s3, z3)
-        transposed = is_op("relax.permute_dims")(d1)
+        t1 = is_op("relax.permute_dims")(d1)
         s4 = wildcard()
         z4 = wildcard()
-        q2 = is_op("relax.quantize")(transposed, s4, z4)
+        q2 = is_op("relax.quantize")(t1, s4, z4)
         s5 = wildcard()
         z5 = wildcard()
         d2 = is_op("relax.dequantize")(q2, s5, z5)
-        lhs = is_op("relax.broadcast_to")(d2, wildcard()) | d2
+        lhs_theta = is_op("relax.broadcast_to")(d2, wildcard()) | d2
 
         # RHS: phi branch - int8 -> DQ -> reshape -> Q -> DQ
         input_phi = wildcard()
@@ -169,102 +177,78 @@ def matmul_softmax_pattern():
         s7 = wildcard()
         z7 = wildcard()
         d3 = is_op("relax.dequantize")(q3, s7, z7)
-        rhs = is_op("relax.broadcast_to")(d3, wildcard()) | d3
+        rhs_phi = is_op("relax.broadcast_to")(d3, wildcard()) | d3
 
-        matmul = is_op("relax.matmul")(lhs, rhs)
-        softmax = is_op("relax.nn.softmax")(matmul)
-        output = is_op("relax.broadcast_to")(softmax, wildcard()) | softmax
-
-        annotations = {
-            "input":    x0,
-            "weight":    input_phi,
-            "scale_in": s0,            # theta int8 input DQ scale
-            "scale_w": scale_phi_dq,  # phi   int8 input DQ scale
-            #"scale_out": 1.0,
-            #"root":      output,
-        }
-        return output, annotations
-
-    def _attrs_getter(annotated_expr):
-        scale_lhs = annotated_expr["scale_in"].data.numpy().item()
-        scale_rhs = annotated_expr["scale_w"].data.numpy().item()
-        return {
-            "act": "SOFTMAX",
-            "acc_scale": float(scale_lhs * scale_rhs / 1.0),
-        }
-
-    def _check_matmul_softmax_pattern(context: PatternCheckContext) -> bool:
-        return True
-
-    return ("gemmini.matmul_softmax", *_make_matmul_softmax_pattern(), _check_matmul_softmax_pattern, _attrs_getter)
+        matmul0 = is_op("relax.matmul")(lhs_theta, rhs_phi)
+        softmax = is_op("relax.nn.softmax")(matmul0)
+        output_phi = is_op("relax.broadcast_to")(softmax, wildcard()) | softmax
 
 
-def matmul_transpose_pattern():
-    """
-    wildcard (e.g. softmax), int8_input -> DQ -> reshape -> Q -> DQ -> permute_dims -> Q -> DQ
-    -> matmul(wildcard, DQ) -> permute_dims -> reshape -> Q
-    """
-
-    def _make_matmul_transpose_pattern():
-        # LHS: any float input (e.g. softmax attention weights)
-        input0 = wildcard()
-        lhs = is_op("relax.broadcast_to")(input0, wildcard()) | input0
+        # LHS: softmax attention weights
+        lhs_g = is_op("relax.broadcast_to")(output_phi, wildcard()) | output_phi
 
         # RHS: full g-branch chain: int8 -> DQ -> reshape -> Q -> DQ -> permute_dims -> Q -> DQ
-        input1 = wildcard()
-        scale_g0_dq = wildcard()
-        zp_g0_dq = wildcard()
-        dq_g0 = is_op("relax.dequantize")(input1, scale_g0_dq, zp_g0_dq)
+        input_g = wildcard()
+        scale_g_dq = wildcard()
+        zp_g_dq = wildcard()
+        dq_g0 = is_op("relax.dequantize")(input_g, scale_g_dq, zp_g_dq)
 
-        reshape_g = is_op("relax.reshape")(dq_g0, wildcard())
+        r1 = is_op("relax.reshape")(dq_g0, wildcard())
 
-        scale_g1_q = wildcard()
-        zp_g1_q = wildcard()
-        q_g1 = is_op("relax.quantize")(reshape_g, scale_g1_q, zp_g1_q)
+        s8 = wildcard()
+        z8 = wildcard()
+        q4 = is_op("relax.quantize")(r1, s8, z8)
 
-        scale_g1_dq = wildcard()
-        zp_g1_dq = wildcard()
-        dq_g1 = is_op("relax.dequantize")(q_g1, scale_g1_dq, zp_g1_dq)
+        s9 = wildcard()
+        z9 = wildcard()
+        d4 = is_op("relax.dequantize")(q4, s9, z9)
 
-        permute_g = is_op("relax.permute_dims")(dq_g1)
+        t2 = is_op("relax.permute_dims")(d4)
 
-        scale_g2_q = wildcard()
-        zp_g2_q = wildcard()
-        q_g2 = is_op("relax.quantize")(permute_g, scale_g2_q, zp_g2_q)
+        s9 = wildcard()
+        z9 = wildcard()
+        q5 = is_op("relax.quantize")(t2, s9, z9)
 
-        scale_g2_dq = wildcard()
-        zp_g2_dq = wildcard()
-        requant_g = is_op("relax.dequantize")(q_g2, scale_g2_dq, zp_g2_dq)
-        rhs = is_op("relax.broadcast_to")(requant_g, wildcard()) | requant_g
+        s10 = wildcard()
+        z10 = wildcard()
+        d5 = is_op("relax.dequantize")(q5, s10, z10)
+        rhs_g = is_op("relax.broadcast_to")(d5, wildcard()) | d5
 
-        matmul = is_op("relax.matmul")(lhs, rhs)
-        transposed = is_op("relax.permute_dims")(matmul)
-        reshape = is_op("relax.reshape")(transposed, wildcard())
-        scale0_q = wildcard()
-        zp0_q = wildcard()
-        output = is_op("relax.quantize")(reshape, scale0_q, zp0_q)
+        matmul1 = is_op("relax.matmul")(lhs_g, rhs_g)
+        t3 = is_op("relax.permute_dims")(matmul1)
+        r2 = is_op("relax.reshape")(t3, wildcard())
+        s11 = wildcard()
+        z11 = wildcard()
+        output = is_op("relax.quantize")(r2, s11, z11)
 
         annotations = {
-            "input":    input0,
-            "weight":    input1,
-            #"scale_in": 1.0,
-            "scale_w": scale_g0_dq,  # g-branch int8 input DQ scale
-            "scale_out": scale0_q,     # output Q scale
+            "input_theta":    input_theta,
+            "input_phi":    input_phi,
+            "scale_theta": s5,
+            "scale_phi": s7,
+            "input_g":    input_g,
+            "scale_g": s10,
+            "scale_out": s11,     # output Q scale
         }
         return output, annotations
 
     def _attrs_getter(annotated_expr):
-        scale_rhs = annotated_expr["scale_w"].data.numpy().item()
+        scale_theta = annotated_expr["scale_theta"].data.numpy().item()
+        scale_phi = annotated_expr["scale_phi"].data.numpy().item()
+        scale_g = annotated_expr["scale_g"].data.numpy().item()
         scale_out = annotated_expr["scale_out"].data.numpy().item()
+        SOFTMAX_OUTPUT_SCALE = 1.0 / 127.0
+
         return {
-            "act": "NO_ACTIVATION",
-            "acc_scale": float(1.0 * scale_rhs / scale_out),
+            "acc_scale0": 1.0,
+            "bert_scale": scale_theta * scale_phi,
+            "acc_scale1": float(scale_g * SOFTMAX_OUTPUT_SCALE / scale_out),
         }
 
-    def _check_matmul_transpose_pattern(context: PatternCheckContext) -> bool:
-        return _check_gemmini_quantization(context)
+    def _check_matmul_self_attention_pattern(context: PatternCheckContext) -> bool:
+        return True
 
-    return ("gemmini.matmul_transpose", *_make_matmul_transpose_pattern(), _check_matmul_transpose_pattern, _attrs_getter)
+    return ("gemmini.matmul_self_attention", *_make_matmul_self_attention_pattern(), _check_matmul_self_attention_pattern, _attrs_getter)
 
 
 def resadd_leakyrelu_pattern():
@@ -325,7 +309,7 @@ def resadd_leakyrelu_pattern():
 
 def conv2d_leakyrelu_pattern():
     """
-    input -> DQ, weight -> DQ -> conv2d(dq, weight), bias -> reshape, add(conv2d, reshape) -> Q/DQ -> leakyrelu -> reshape -> Q
+    input -> DQ, weight -> DQ -> conv2d(dq, weight), bias -> DQ -> reshape, add(conv2d, reshape) -> Q/DQ -> leakyrelu -> reshape -> Q
     """
 
     def _make_conv2d_leakyrelu_pattern():
@@ -345,7 +329,10 @@ def conv2d_leakyrelu_pattern():
         conv = is_op("relax.nn.conv2d")(requant_t, weight_t)
 
         bias = wildcard()
-        bias_reshape = is_op("relax.reshape")(bias, wildcard())
+        sb = wildcard()
+        zb = wildcard()
+        bias_d = is_op("relax.dequantize")(bias, sb, zb)
+        bias_reshape = is_op("relax.reshape")(bias_d, wildcard())
         bias_t = is_op("relax.permute_dims")(bias_reshape) | bias_reshape
         add = is_op("relax.add")(conv, bias_t)
 
@@ -381,7 +368,7 @@ def conv2d_leakyrelu_pattern():
         conv_attrs = annotated_expr["conv"].attrs
         stride = int(conv_attrs.strides[0])
         padding = int(conv_attrs.padding[0])
-        kernel_dim = int(annotated_expr["weight"].struct_info.shape[2])
+        kernel_dim = int(annotated_expr["weight"].struct_info.shape[0])
         return {
             "act": "RELU",
             "acc_scale": float(scale_in * scale_w / scale_out),
@@ -416,7 +403,10 @@ def fc_leakyrelu_pattern():
         matmul = is_op("relax.matmul")(lhs, rhs)
 
         bias = wildcard()
-        add = is_op("relax.add")(bias, matmul)
+        sb = wildcard()
+        zb = wildcard()
+        bias_d = is_op("relax.dequantize")(bias, sb, zb)
+        add = is_op("relax.add")(bias_d, matmul)
 
         scale1_q = wildcard()
         zp1_q = wildcard()
@@ -475,7 +465,10 @@ def fc_pattern():
         matmul = is_op("relax.matmul")(lhs, rhs)
 
         bias = wildcard()
-        add = is_op("relax.add")(bias, matmul)
+        sb = wildcard()
+        zb = wildcard()
+        bias_d = is_op("relax.dequantize")(bias, sb, zb)
+        add = is_op("relax.add")(bias_d, matmul)
 
         scale_q = wildcard()
         zp_q = wildcard()
@@ -510,8 +503,7 @@ def fc_pattern():
 register_patterns(
     [
         conv2d_pattern(), # Fused patterns first (higher priority)
-        matmul_softmax_pattern(),
-        matmul_transpose_pattern(),
+        matmul_self_attention_pattern(),
         resadd_leakyrelu_pattern(),
         conv2d_leakyrelu_pattern(),
         fc_pattern(),

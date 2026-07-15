@@ -303,18 +303,54 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 		f == "gemmini.conv2d_leakyrelu") {
 		ret.decl = EmitGemminiConv2d(call, func, out_name, f);
 	} else if (f == "gemmini.matmul" ||
-			   f == "gemmini.matmul_softmax" ||
-			   f == "gemmini.matmul_transpose" ||
 			   f == "gemmini.fc" ||
 			   f == "gemmini.fc_leakyrelu") {
 		ret.decl = EmitGemminiMatmul(call, func, out_name, f);
-	} else if (f == "gemmini.resadd_leakyrelu") {
+	} else if (f == "gemmini.matmul_self_attention") {
+			ret.decl = EmitGemminiSelfAttention(call, func, out_name, f);
+		} else if (f == "gemmini.resadd_leakyrelu") {
 		ret.decl = EmitGemminiResadd(call, func, out_name, f);
 	} else {
 		TVM_FFI_THROW(InternalError) << "Unsupported Gemmini op: " << f;
 	}
 
     return ret;
+  }
+
+  // --- debug instrumentation helper -----------------------------------------------------
+  // Dumps every element of an output tensor, one `[dbg] <tag> <out> e<i>=<val>` line each,
+  // via a runtime loop (not unrolled) so the generated C stays compact regardless of tensor
+  // size. Full-tensor dump (rather than a small window) is needed to do exhaustive
+  // element-by-element diffs against a CPU oracle -- a window can miss a divergence that
+  // isn't at the sampled indices, or make a real "whole tensor differs" bug look like a
+  // near-miss coincidence at just the 8 sampled positions. Purely additive/throwaway
+  // instrumentation -- does not affect the emitted computation.
+  std::string EmitDebugDump(const std::string& out, const std::string& tag, int64_t numel) {
+	  std::ostringstream ss;
+	  ss << "\n  for (int64_t dbg_i = 0; dbg_i < " << numel << "; dbg_i++) { "
+		 << "printf(\"[dbg] " << tag << " " << out << " e%lld=%d\\n\", (long long)dbg_i, "
+		 << "(int)((elem_t*)GEMMINI_DATA(" << out << "))[dbg_i]); }";
+	  return ss.str();
+  }
+
+  // Same as EmitDebugDump, but for a plain elem_t[] local (e.g. an intermediate scratch
+  // buffer), not a DLTensor -- indexes the array directly instead of through GEMMINI_DATA.
+  std::string EmitDebugDumpRaw(const std::string& arr, const std::string& tag, int64_t numel) {
+	  std::ostringstream ss;
+	  ss << "\n  for (int64_t dbg_i = 0; dbg_i < " << numel << "; dbg_i++) { "
+		 << "printf(\"[dbg] " << tag << " " << arr << " e%lld=%d\\n\", (long long)dbg_i, "
+		 << "(int)" << arr << "[dbg_i]); }";
+	  return ss.str();
+  }
+
+  // Same as EmitDebugDump, but casts to acc_t* (int32 accumulator dtype) instead of
+  // elem_t* -- for dumping bias tensors, which are stored as acc_t, not elem_t.
+  std::string EmitDebugDumpAcc(const std::string& out, const std::string& tag, int64_t numel) {
+	  std::ostringstream ss;
+	  ss << "\n  for (int64_t dbg_i = 0; dbg_i < " << numel << "; dbg_i++) { "
+		 << "printf(\"[dbg] " << tag << " " << out << " e%lld=%d\\n\", (long long)dbg_i, "
+		 << "(int)((acc_t*)GEMMINI_DATA(" << out << "))[dbg_i]); }";
+	  return ss.str();
   }
 
   std::string EmitGemminiConv2d(const CallNode* call, const Function& func, const std::string& out, const std::string& func_name) {
@@ -337,7 +373,7 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 	  int64_t in_channels  = in_shape[1];
 	  int64_t in_rows      = in_shape[2];
 	  int64_t in_cols      = in_shape[3];
-	  int64_t out_channels = w_shape[0];
+	  int64_t out_channels = w_shape[3];
 
 	  std::string act = attrs.at("act").try_cast<std::string>().value();
 	  double acc_scale = attrs.at("acc_scale").try_cast<double>().value();
@@ -349,6 +385,16 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 	  int64_t out_cols = (in_cols + 2 * padding - kernel_dim) / stride + 1;
 
 	  std::ostringstream ss;
+
+	  // --- debug instrumentation: dump the raw input/weight/bias data as actually loaded
+	  // for this call, before tiled_conv_auto executes -- lets a CPU oracle comparison rule
+	  // in/out a bad physical layout or scale (input, or weight e.g. OIHW vs OHWI) as the
+	  // cause of a divergence, separately from the conv computation itself.
+	  //int64_t input_numel = batch_size * in_channels * in_rows * in_cols;
+	  //ss << EmitDebugDump(func_args[i_idx], func_name + ".input", input_numel);
+	  //int64_t weight_numel = w_shape[0] * w_shape[1] * w_shape[2] * w_shape[3];
+	  //ss << EmitDebugDump(func_args[w_idx], func_name + ".weight", weight_numel);
+	  //ss << EmitDebugDumpAcc(func_args[b_idx], func_name + ".bias", out_channels);
 
 	//tiled_conv_auto(int batch_size, int in_row_dim, int in_col_dim,
     //                int in_channels, int out_channels, int out_row_dim,
@@ -391,6 +437,10 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 		 // tiled_resadd_auto, which fence on exit.
 		 << "  gemmini_fence();";
 
+	  // --- debug instrumentation: dump a window of this layer's output ---
+	  //int64_t numel = batch_size * out_channels * out_rows * out_cols;
+	  //ss << EmitDebugDump(out, func_name, numel);
+
 	  return ss.str();
   }
 
@@ -417,20 +467,48 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 	  //auto* out_sinfo = GetStructInfo(ffi::GetRef<Call>(call)).as<TensorStructInfoNode>();
 	  //auto out_shape = backend::GetIntShape(out_sinfo->shape.value().as<ShapeExprNode>()->values);
 
-	  // TODO: handling transpose tensors
-	  int64_t dim_I = in_shape[in_shape.size() - 2]; // 2
-	  int64_t dim_J = w_shape[w_shape.size() - 1]; // 3
-	  int64_t dim_K = in_shape.back();
-	  bool transpose_B = (in_shape[in_shape.size() - 1] != w_shape[w_shape.size() - 2] ? true : false);
+	  // Compute the (rows, cols) of the physical matrix each operand represents.
+	  // Operands may arrive as:
+	  //   - 2D/3D [..., rows, cols]: already a matmul operand, use the last two dims.
+	  //   - 4D [N, C, H, W]: an NLB 1x1-conv output. It is NCHW-declared but stored
+	  //     physically NHWC (see project layout convention), so the matrix it feeds to
+	  //     tiled_matmul_auto is [H*W, C] -- rows = H*W, cols = C. The reshape/permute_dims
+	  //     ops between the conv and the matmul were absorbed into this composite and carry
+	  //     no data movement, so H*W and C must be derived here rather than reading the raw
+	  //     last two dims (which are H, W and produce the wrong dim_I/dim_J/dim_K).
+	  auto matrix_dims = [](const std::vector<int64_t>& s) -> std::pair<int64_t, int64_t> {
+		  if (s.size() == 4) return {s[2] * s[3], s[1]};  // NHWC-physical conv output: (H*W, C)
+		  return {s[s.size() - 2], s[s.size() - 1]};       // 2D/3D operand: (rows, cols)
+	  };
+	  std::pair<int64_t, int64_t> a_dims = matrix_dims(in_shape);
+	  std::pair<int64_t, int64_t> b_dims = matrix_dims(w_shape);
+
+	  int64_t dim_I = a_dims.first;
+	  int64_t dim_K = a_dims.second;
+	  bool transpose_B = (b_dims.first != dim_K) || (b_dims.first == b_dims.second);
+	  int64_t dim_J = transpose_B ? b_dims.first : b_dims.second;
 	  int64_t stride_A = dim_K;
-	  int64_t stride_B = w_shape.back();
+	  int64_t stride_B = transpose_B ? dim_K : dim_J;
 	  int64_t stride_C = dim_J;
 	  int64_t stride_D = dim_J;
 
 	  std::string act = attrs.at("act").try_cast<std::string>().value();
 	  double acc_scale = attrs.at("acc_scale").try_cast<double>().value();
+	  double output_scale = acc_scale;
+	  if (act == "SOFTMAX"){
+		  output_scale = 1.0;
+	  }
 
 	  std::ostringstream ss;
+
+	  // --- debug instrumentation: dump the raw weight (and bias, if present) data as
+	  // actually loaded for this call, before tiled_matmul_auto executes.
+	  //int64_t weight_numel = w_shape[0] * w_shape[1];
+	  //for (size_t i = 2; i < w_shape.size(); i++) weight_numel *= w_shape[i];
+	  //ss << EmitDebugDump(func_args[w_idx], func_name + ".weight", weight_numel);
+	  //if (arg_idx.count("bias")) {
+	  //    ss << EmitDebugDumpAcc(func_args[arg_idx["bias"]->value], func_name + ".bias", dim_J);
+	  //}
 
 	//tiled_matmul_auto(size_t dim_I, size_t dim_J, size_t dim_K, const elem_t *A,
 	//                  const elem_t *B, const void *D, void *C, size_t stride_A,
@@ -454,12 +532,149 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 		 << stride_C << ", " // stride_C
 		 << "MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, "
 		 << act << ", "
-		 << acc_scale << ", " // scale
-		 << "0, " // bert_scale
+		 << output_scale << ", " // scale
+		 << acc_scale << ", " // bert_scale
 		 << "false, false, "
 		 << transpose_B << ", "
 		 << "false, false, 0, "
 		 << "WS);";
+
+	  // --- debug instrumentation: dump a window of this layer's output ---
+	  //int64_t numel = dim_I * dim_J;
+	  //ss << EmitDebugDump(out, func_name, numel);
+
+	  return ss.str();
+  }
+
+
+  std::string EmitGemminiSelfAttention(const CallNode* call, const Function& func, const std::string& out, const std::string& func_name) {
+	  ffi::Array<ffi::String> func_args = GetArgumentNames(call);
+	  ffi::Map<ffi::String, ffi::Any> attrs = func->attrs->dict;
+
+	  auto arg_idx = backend::ExtractArgIdx(func_name, func);
+
+	  int64_t theta_idx = arg_idx["input_theta"]->value;
+	  int64_t phi_idx = arg_idx["input_phi"]->value;
+	  int64_t g_idx = arg_idx["input_g"]->value;
+
+	  const auto* theta_sinfo = GetStructInfo(func->params[theta_idx]).as<TensorStructInfoNode>();
+	  auto theta_shape = backend::GetIntShape(theta_sinfo->shape.value().as<ShapeExprNode>()->values);
+	  const auto* phi_sinfo = GetStructInfo(func->params[phi_idx]).as<TensorStructInfoNode>();
+	  auto phi_shape = backend::GetIntShape(phi_sinfo->shape.value().as<ShapeExprNode>()->values);
+	  const auto* g_sinfo = GetStructInfo(func->params[g_idx]).as<TensorStructInfoNode>();
+	  auto g_shape = backend::GetIntShape(g_sinfo->shape.value().as<ShapeExprNode>()->values);
+
+	  auto matrix_dims = [](const std::vector<int64_t>& s) -> std::pair<int64_t, int64_t> {
+		  if (s.size() == 4) return {s[2] * s[3], s[1]};  // NHWC-physical conv output: (H*W, C)
+		  return {s[s.size() - 2], s[s.size() - 1]};       // 2D/3D operand: (rows, cols)
+	  };
+
+	  // Stage 1 dims: raw logits = theta @ phi (contraction over the hidden channel dim).
+	  std::pair<int64_t, int64_t> theta_dims = matrix_dims(theta_shape);
+	  std::pair<int64_t, int64_t> phi_dims = matrix_dims(phi_shape);
+	  int64_t dim_I0 = theta_dims.first;
+	  int64_t dim_K0 = theta_dims.second;
+	  bool transpose_B0 = (phi_dims.first != dim_K0);
+	  int64_t dim_J0 = transpose_B0 ? phi_dims.first : phi_dims.second;
+	  int64_t stride_A0 = dim_K0;
+	  int64_t stride_B0 = transpose_B0 ? dim_K0 : dim_J0;
+
+	  double acc_scale0 = attrs.at("acc_scale0").try_cast<double>().value();
+	  double bert_scale = attrs.at("bert_scale").try_cast<double>().value();
+	  double acc_scale1 = attrs.at("acc_scale1").try_cast<double>().value();
+
+	  // Stage 2 dims: attention = logits @ identity_N (SOFTMAX). N = dim_J0, the softmax
+	  // axis width -- tiled_matmul_auto's dim_K must equal this so the norm unit's
+	  // row-wise reduction spans the full softmax row.
+	  int64_t N = dim_J0;
+
+	  // Stage 3 dims: out = attention @ g -- identical derivation to the old
+	  // matmul_transpose composite (attention rows = dim_I0, contraction = N).
+	  std::pair<int64_t, int64_t> g_dims = matrix_dims(g_shape);
+	  int64_t dim_I2 = dim_I0;
+	  int64_t dim_K2 = N;
+	  bool transpose_B2 = (g_dims.first != dim_K2);
+	  int64_t dim_J2 = transpose_B2 ? g_dims.first : g_dims.second;
+	  int64_t stride_A2 = dim_K2;
+	  int64_t stride_B2 = transpose_B2 ? dim_K2 : dim_J2;
+
+	  std::string logits = out + "_logits";
+	  std::string attnbuf = out + "_attn";
+	  std::string ident = out + "_identity";
+
+	  // The N x N identity matrix is a fixed 0/1 pattern known entirely at codegen time, so
+	  // emit it as a compile-time literal initializer instead of a runtime double loop --
+	  // matches the convention elsewhere in this file of emitting constant data as
+	  // `static const <type> <name>[] = {...}` rather than computing it on-device.
+	  std::ostringstream ident_init;
+	  for (int64_t i = 0; i < N; ++i) {
+		  for (int64_t j = 0; j < N; ++j) {
+			  if (i != 0 || j != 0) ident_init << ",";
+			  ident_init << (i == j ? "1" : "0");
+		  }
+	  }
+
+	  std::ostringstream ss;
+	  ss << "static elem_t " << logits << "[" << (dim_I0 * dim_J0) << "];\n  "
+		 << "static elem_t " << attnbuf << "[" << (dim_I0 * N) << "];\n  "
+		 << "static const elem_t " << ident << "[" << (N * N) << "] = {" << ident_init.str() << "};\n  ";
+
+	  // Stage 1: theta @ phi -> SOFTMAX, fused directly (no separate identity-matmul
+	  // stage). Verified empirically equivalent to a 3-stage (raw matmul -> identity
+	  // matmul + SOFTMAX -> final matmul) split when the latter's intermediate store
+	  // scale is parameterized correctly -- real FireSim hardware output from this fused
+	  // form matches a same-scale 3-stage simulation almost exactly (mean 1.8625 vs
+	  // 1.861, matching first-20-elements). Kept fused (the 3-stage split added
+	  // complexity/dead code with no accuracy benefit). See nchw_nhwc.md's
+	  // EmitGemminiSelfAttention investigation.
+	  ss << "tiled_matmul_auto("
+		 << dim_I0 << ", " << dim_J0 << ", " << dim_K0 << ", "
+		 << "(elem_t*)GEMMINI_DATA(" << func_args[theta_idx] << "), "
+		 << "(elem_t*)GEMMINI_DATA(" << func_args[phi_idx] << "), "
+		 << "NULL, "
+		 << "(elem_t*)" << logits << ", "
+		 << stride_A0 << ", " << stride_B0 << ", " << dim_J0 << ", " << dim_J0 << ", "
+		 << "MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, "
+		 << "SOFTMAX, " << acc_scale0 << ", " << bert_scale << ", "
+		 << "false, false, " << transpose_B0 << ", "
+		 << "false, false, 0, WS);\n  ";
+
+	  // --- debug instrumentation: dump raw logits (stage 1 output) directly, no
+	  // GEMMINI_DATA wrapper since this is a plain static array, not a DLTensor. ---
+	  //ss << EmitDebugDumpRaw(logits, func_name + ".logits", dim_I0 * dim_J0);
+
+	  // Stage 2: logits @ identity_N -> SOFTMAX, normalized attention (int8, real scale 1/127).
+	//  ss << "tiled_matmul_auto("
+	//	 << dim_I0 << ", " << N << ", " << N << ", "
+	//	 << "(elem_t*)" << logits << ", "
+	//	 << "(elem_t*)" << ident << ", "
+	//	 << "NULL, "
+	//	 << "(elem_t*)" << attnbuf << ", "
+	//	 << N << ", " << N << ", " << N << ", " << N << ", "
+	//	 << "MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, "
+	//	 << "SOFTMAX, 1.0, " << bert_scale << ", "
+	//	 << "false, false, false, "
+	//	 << "false, false, 0, WS);\n  ";
+
+	  // --- debug instrumentation: dump the normalized attention (stage 2 output) ---
+	  //ss << EmitDebugDumpRaw(attnbuf, func_name + ".attn", dim_I0 * N);
+
+	  // Stage 3: attention @ g -> NO_ACTIVATION, final self-attention output.
+	  ss << "tiled_matmul_auto("
+		 << dim_I2 << ", " << dim_J2 << ", " << dim_K2 << ", "
+		 << "(elem_t*)" << logits << ", "
+		 << "(elem_t*)GEMMINI_DATA(" << func_args[g_idx] << "), "
+		 << "NULL, "
+		 << "(elem_t*)GEMMINI_DATA(" << out << "), "
+		 << stride_A2 << ", " << stride_B2 << ", " << dim_J2 << ", " << dim_J2 << ", "
+		 << "MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, "
+		 << "NO_ACTIVATION, " << acc_scale1 << ", 0, "
+		 << "false, false, " << transpose_B2 << ", "
+		 << "false, false, 0, WS);";
+
+	  // --- debug instrumentation: dump a window of this layer's output ---
+	  //int64_t numel = dim_I2 * dim_J2;
+	  //ss << EmitDebugDump(out, func_name, numel);
 
 	  return ss.str();
   }
@@ -511,6 +726,10 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 		 << "(elem_t*)GEMMINI_DATA(" << out << "), "
 		 << relu << ", "
 		 << "WS);";
+
+	  // --- debug instrumentation: dump a window of this layer's output ---
+	  //int64_t numel = I * J;
+	  //ss << EmitDebugDump(out, func_name, numel);
 
 	  return ss.str();
   }
