@@ -55,6 +55,8 @@ std::string EmitSignature(const std::vector<Output>& out, const std::string& fun
   return code_stream_.str();
 }
 
+constexpr int kGemminiNumClockCycles = 14;
+
 ffi::Module Finalize(const std::string& code, const ffi::Array<ffi::String>& func_names) {
   TVM_FFI_ICHECK(!func_names.empty())
       << "Should only create Gemmini CSourceModule if there is at least one Gemmini partition";
@@ -83,9 +85,39 @@ ffi::Module Finalize(const std::string& code, const ffi::Array<ffi::String>& fun
   // GEMMINI_DATA folds the offset into a byte pointer for casting.
   default_headers << "#define GEMMINI_DATA(t) ((void*)((char*)((t)->data) + (t)->byte_offset))\n";
 
+
+  // For debugging: measure per-Gemmini-call elapsed cycles.
+  default_headers << "static inline unsigned long long read_cycles() {\n"
+  				  << "	uint64_t cycles;\n"
+				  << "	asm volatile (\"rdcycle %0\" : \"=r\" (cycles));\n"
+				  << "	return cycles;\n"
+				  << "}\n";
+  default_headers << "#define GEMMINI_NUM_CLOCK_CYCLES " << kGemminiNumClockCycles << "\n";
+  default_headers << "static unsigned long long "
+                      "gemmini_clock_cycles[GEMMINI_NUM_CLOCK_CYCLES];\n";
+  default_headers << "static int gemmini_clock_cycle_idx = 0;\n";
+
+  // Host-callable accessor: copies the recorded per-call cycle counts into the
+  // caller-supplied uint64 output tensor (shape [GEMMINI_NUM_CLOCK_CYCLES]) and
+  // resets the counter so the next inference starts recording from index 0.
+  default_headers << "\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
+  default_headers << "TVM_FFI_DLL_EXPORT int __tvm_ffi_gemmini_clock_cycles(\n";
+  default_headers << "    void* handle, const TVMFFIAny* args,\n";
+  default_headers << "    int32_t num_args, TVMFFIAny* result) {\n";
+  default_headers << "  DLTensor* out0 = GEMMINI_READ_TENSOR(&args[0]);\n";
+  default_headers << "  unsigned long long* dst = (unsigned long long*)GEMMINI_DATA(out0);\n";
+  default_headers << "  for (int k = 0; k < GEMMINI_NUM_CLOCK_CYCLES; k++) "
+                      "dst[k] = gemmini_clock_cycles[k];\n";
+  default_headers << "  gemmini_clock_cycle_idx = 0;\n";
+  default_headers << "  return 0;\n}\n";
+  default_headers << "#ifdef __cplusplus\n}\n#endif\n";
+
+  ffi::Array<ffi::String> all_func_names = func_names;
+  all_func_names.push_back("gemmini_clock_cycles");
+
   const auto pf = tvm::ffi::Function::GetGlobalRequired("runtime.CSourceModuleCreate");
   VLOG(1) << "Generated Gemmini code:" << std::endl << code;
-  return pf(default_headers.str() + code, "c", func_names,
+  return pf(default_headers.str() + code, "c", all_func_names,
             /*const_vars=*/ffi::Array<ffi::String>())
       .cast<ffi::Module>();
 }
@@ -107,43 +139,6 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
   }
 
   std::string JIT(const OutputType& out) final {
-	// Generate C source that use raw pointers without wrapping by DLTensor
-
-    //code_stream_ << "void " << ext_func_id_ << "_(";
-
-    //for (const auto& arg : ext_func_args_) {
-    //  const auto& dtype_str = GetDtypeString(arg);
-    //  code_stream_ << dtype_str << "* " << arg->name_hint() << ", ";
-    //}
-    //for (size_t i = 0; i < out.size() - 1; ++i) {
-    //  code_stream_ << out[i].dtype << "* out" << i << ", ";
-    //}
-    //code_stream_ << out.back().dtype << "* out" << out.size() - 1 << ") {\n";
-    //this->EnterScope();
-
-    //// Function body
-    //for (auto decl : buf_decl_) {
-    //  this->PrintIndents();
-    //  code_stream_ << decl << "\n";
-    //}
-    //code_stream_ << "\n";
-    //for (auto stmt : ext_func_body_) {
-    //  this->PrintIndents();
-    //  code_stream_ << stmt << "\n";
-    //}
-
-    //this->ExitScope();
-    //code_stream_ << "}\n";
-
-    //std::vector<std::string> arg_types;
-    //for (const auto& arg : ext_func_args_) {
-    //  arg_types.push_back(GetDtypeString(arg));
-    //}
-
-    //GenerateBackendCFunc(ext_func_id_, arg_types, "", out, /*pass_dl_tensor=*/false);
-    //return code_stream_.str();
-
-
     std::vector<std::string> arg_names;
     for (const auto& arg : ext_func_args_) {
       arg_names.push_back(var_name_map_.at(arg.get()));
@@ -317,14 +312,7 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
     return ret;
   }
 
-  // --- debug instrumentation helper -----------------------------------------------------
-  // Dumps every element of an output tensor, one `[dbg] <tag> <out> e<i>=<val>` line each,
-  // via a runtime loop (not unrolled) so the generated C stays compact regardless of tensor
-  // size. Full-tensor dump (rather than a small window) is needed to do exhaustive
-  // element-by-element diffs against a CPU oracle -- a window can miss a divergence that
-  // isn't at the sampled indices, or make a real "whole tensor differs" bug look like a
-  // near-miss coincidence at just the 8 sampled positions. Purely additive/throwaway
-  // instrumentation -- does not affect the emitted computation.
+
   std::string EmitDebugDump(const std::string& out, const std::string& tag, int64_t numel) {
 	  std::ostringstream ss;
 	  ss << "\n  for (int64_t dbg_i = 0; dbg_i < " << numel << "; dbg_i++) { "
@@ -333,8 +321,7 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 	  return ss.str();
   }
 
-  // Same as EmitDebugDump, but for a plain elem_t[] local (e.g. an intermediate scratch
-  // buffer), not a DLTensor -- indexes the array directly instead of through GEMMINI_DATA.
+
   std::string EmitDebugDumpRaw(const std::string& arr, const std::string& tag, int64_t numel) {
 	  std::ostringstream ss;
 	  ss << "\n  for (int64_t dbg_i = 0; dbg_i < " << numel << "; dbg_i++) { "
@@ -343,8 +330,7 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 	  return ss.str();
   }
 
-  // Same as EmitDebugDump, but casts to acc_t* (int32 accumulator dtype) instead of
-  // elem_t* -- for dumping bias tensors, which are stored as acc_t, not elem_t.
+
   std::string EmitDebugDumpAcc(const std::string& out, const std::string& tag, int64_t numel) {
 	  std::ostringstream ss;
 	  ss << "\n  for (int64_t dbg_i = 0; dbg_i < " << numel << "; dbg_i++) { "
@@ -352,6 +338,7 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 		 << "(int)((acc_t*)GEMMINI_DATA(" << out << "))[dbg_i]); }";
 	  return ss.str();
   }
+
 
   std::string EmitGemminiConv2d(const CallNode* call, const Function& func, const std::string& out, const std::string& func_name) {
       ffi::Array<ffi::String> func_args = GetArgumentNames(call);
@@ -386,9 +373,6 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 
 	  std::ostringstream ss;
 
-	  // --- debug instrumentation: dump the raw input/weight/bias data as actually loaded
-	  // for this call, before tiled_conv_auto executes -- lets a CPU oracle comparison rule
-	  // in/out a bad physical layout or scale (input, or weight e.g. OIHW vs OHWI) as the
 	  // cause of a divergence, separately from the conv computation itself.
 	  //int64_t input_numel = batch_size * in_channels * in_rows * in_cols;
 	  //ss << EmitDebugDump(func_args[i_idx], func_name + ".input", input_numel);
@@ -411,7 +395,8 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
     //                int pool_stride, int pool_padding,
 
     //                enum tiled_matmul_type_t tiled_conv_type) {
-	  ss << "tiled_conv_auto("
+	  ss << "unsigned long long start = read_cycles();\n"
+	     << "tiled_conv_auto("
 		 << batch_size << ", "
 		 << in_rows << ", "
 		 << in_cols << ", "
@@ -435,9 +420,10 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 		 << "WS);\n"
 		 // tiled_conv_auto does NOT fence internally unlike tiled_matmul_auto /
 		 // tiled_resadd_auto, which fence on exit.
-		 << "  gemmini_fence();";
+		 << "gemmini_fence();"
+	     << "unsigned long long end = read_cycles();\n"
+		 << "gemmini_clock_cycles[gemmini_clock_cycle_idx++] = end - start;\n";
 
-	  // --- debug instrumentation: dump a window of this layer's output ---
 	  //int64_t numel = batch_size * out_channels * out_rows * out_cols;
 	  //ss << EmitDebugDump(out, func_name, numel);
 
@@ -467,15 +453,7 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 	  //auto* out_sinfo = GetStructInfo(ffi::GetRef<Call>(call)).as<TensorStructInfoNode>();
 	  //auto out_shape = backend::GetIntShape(out_sinfo->shape.value().as<ShapeExprNode>()->values);
 
-	  // Compute the (rows, cols) of the physical matrix each operand represents.
-	  // Operands may arrive as:
-	  //   - 2D/3D [..., rows, cols]: already a matmul operand, use the last two dims.
-	  //   - 4D [N, C, H, W]: an NLB 1x1-conv output. It is NCHW-declared but stored
-	  //     physically NHWC (see project layout convention), so the matrix it feeds to
-	  //     tiled_matmul_auto is [H*W, C] -- rows = H*W, cols = C. The reshape/permute_dims
-	  //     ops between the conv and the matmul were absorbed into this composite and carry
-	  //     no data movement, so H*W and C must be derived here rather than reading the raw
-	  //     last two dims (which are H, W and produce the wrong dim_I/dim_J/dim_K).
+	  // The reshape and permute_dims ops between the conv and the matmul were absorbed into this composite, so must set H*W as rows and C as cols
 	  auto matrix_dims = [](const std::vector<int64_t>& s) -> std::pair<int64_t, int64_t> {
 		  if (s.size() == 4) return {s[2] * s[3], s[1]};  // NHWC-physical conv output: (H*W, C)
 		  return {s[s.size() - 2], s[s.size() - 1]};       // 2D/3D operand: (rows, cols)
@@ -501,8 +479,6 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 
 	  std::ostringstream ss;
 
-	  // --- debug instrumentation: dump the raw weight (and bias, if present) data as
-	  // actually loaded for this call, before tiled_matmul_auto executes.
 	  //int64_t weight_numel = w_shape[0] * w_shape[1];
 	  //for (size_t i = 2; i < w_shape.size(); i++) weight_numel *= w_shape[i];
 	  //ss << EmitDebugDump(func_args[w_idx], func_name + ".weight", weight_numel);
@@ -518,7 +494,8 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 	//                  acc_scale_t bert_scale, bool repeating_bias, bool transpose_A,
 	//                  bool transpose_B, bool full_C, bool low_D, uint8_t weightA,
 	//                  enum tiled_matmul_type_t tiled_matmul_type) {
-	  ss << "tiled_matmul_auto("
+	  ss << "unsigned long long start = read_cycles();\n"
+	     << "tiled_matmul_auto("
 		 << dim_I << ", "
 		 << dim_J << ", "
 		 << dim_K << ", "
@@ -537,7 +514,9 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 		 << "false, false, "
 		 << transpose_B << ", "
 		 << "false, false, 0, "
-		 << "WS);";
+		 << "WS);\n"
+	     << "unsigned long long end = read_cycles();\n"
+		 << "gemmini_clock_cycles[gemmini_clock_cycle_idx++] = end - start;\n";
 
 	  // --- debug instrumentation: dump a window of this layer's output ---
 	  //int64_t numel = dim_I * dim_J;
@@ -619,15 +598,8 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 		 << "static elem_t " << attnbuf << "[" << (dim_I0 * N) << "];\n  "
 		 << "static const elem_t " << ident << "[" << (N * N) << "] = {" << ident_init.str() << "};\n  ";
 
-	  // Stage 1: theta @ phi -> SOFTMAX, fused directly (no separate identity-matmul
-	  // stage). Verified empirically equivalent to a 3-stage (raw matmul -> identity
-	  // matmul + SOFTMAX -> final matmul) split when the latter's intermediate store
-	  // scale is parameterized correctly -- real FireSim hardware output from this fused
-	  // form matches a same-scale 3-stage simulation almost exactly (mean 1.8625 vs
-	  // 1.861, matching first-20-elements). Kept fused (the 3-stage split added
-	  // complexity/dead code with no accuracy benefit). See nchw_nhwc.md's
-	  // EmitGemminiSelfAttention investigation.
-	  ss << "tiled_matmul_auto("
+	  ss << "unsigned long long start = read_cycles();\n"
+	     << "tiled_matmul_auto("
 		 << dim_I0 << ", " << dim_J0 << ", " << dim_K0 << ", "
 		 << "(elem_t*)GEMMINI_DATA(" << func_args[theta_idx] << "), "
 		 << "(elem_t*)GEMMINI_DATA(" << func_args[phi_idx] << "), "
@@ -639,27 +611,8 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 		 << "false, false, " << transpose_B0 << ", "
 		 << "false, false, 0, WS);\n  ";
 
-	  // --- debug instrumentation: dump raw logits (stage 1 output) directly, no
-	  // GEMMINI_DATA wrapper since this is a plain static array, not a DLTensor. ---
 	  //ss << EmitDebugDumpRaw(logits, func_name + ".logits", dim_I0 * dim_J0);
 
-	  // Stage 2: logits @ identity_N -> SOFTMAX, normalized attention (int8, real scale 1/127).
-	//  ss << "tiled_matmul_auto("
-	//	 << dim_I0 << ", " << N << ", " << N << ", "
-	//	 << "(elem_t*)" << logits << ", "
-	//	 << "(elem_t*)" << ident << ", "
-	//	 << "NULL, "
-	//	 << "(elem_t*)" << attnbuf << ", "
-	//	 << N << ", " << N << ", " << N << ", " << N << ", "
-	//	 << "MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, "
-	//	 << "SOFTMAX, 1.0, " << bert_scale << ", "
-	//	 << "false, false, false, "
-	//	 << "false, false, 0, WS);\n  ";
-
-	  // --- debug instrumentation: dump the normalized attention (stage 2 output) ---
-	  //ss << EmitDebugDumpRaw(attnbuf, func_name + ".attn", dim_I0 * N);
-
-	  // Stage 3: attention @ g -> NO_ACTIVATION, final self-attention output.
 	  ss << "tiled_matmul_auto("
 		 << dim_I2 << ", " << dim_J2 << ", " << dim_K2 << ", "
 		 << "(elem_t*)" << logits << ", "
@@ -670,9 +623,10 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 		 << "MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, "
 		 << "NO_ACTIVATION, " << acc_scale1 << ", 0, "
 		 << "false, false, " << transpose_B2 << ", "
-		 << "false, false, 0, WS);";
+		 << "false, false, 0, WS);"
+	     << "unsigned long long end = read_cycles();\n"
+		 << "gemmini_clock_cycles[gemmini_clock_cycle_idx++] = end - start;\n";
 
-	  // --- debug instrumentation: dump a window of this layer's output ---
 	  //int64_t numel = dim_I2 * dim_J2;
 	  //ss << EmitDebugDump(out, func_name, numel);
 
@@ -712,7 +666,8 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 //	                               const acc_scale_t C_scale, const elem_t *A,
 //	                               const elem_t *B, elem_t *C, bool relu,
 //	                               enum tiled_matmul_type_t matadd_type) {
-	  ss << "tiled_resadd_auto("
+	  ss << "unsigned long long start = read_cycles();\n"
+	     << "tiled_resadd_auto("
 		 << I << ", "
 		 << J << ", "
 		 << A_scale << ", "
@@ -725,9 +680,10 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 	  	 << "(elem_t*)GEMMINI_DATA(" << func_args[i1_idx] << "), "
 		 << "(elem_t*)GEMMINI_DATA(" << out << "), "
 		 << relu << ", "
-		 << "WS);";
+		 << "WS);\n"
+	     << "unsigned long long end = read_cycles();\n"
+		 << "gemmini_clock_cycles[gemmini_clock_cycle_idx++] = end - start;\n";
 
-	  // --- debug instrumentation: dump a window of this layer's output ---
 	  //int64_t numel = I * J;
 	  //ss << EmitDebugDump(out, func_name, numel);
 

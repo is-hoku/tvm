@@ -7,6 +7,10 @@
 #include <cmath>
 #include <cstdio>
 
+#include <unordered_map>
+#include <vector>
+#include <string>
+
 static inline unsigned long long read_cycles() {
   uint64_t cycles;
   asm volatile ("rdcycle %0" : "=r" (cycles));
@@ -14,6 +18,7 @@ static inline unsigned long long read_cycles() {
 }
 
 #define NUM_TEST_PATCHES 10
+#define GEMMINI_NUM_CLOCK_CYCLES 14  // must match kGemminiNumClockCycles in codegen.cc
 
 // Test patches and labels below are taken from
 // 3rdparty/gemmini/bareMetalC/braggnn.h (test_input_0..9 / test_label_0..9).
@@ -194,7 +199,8 @@ struct CPUAllocator {
 	for (int i = 0; i < tensor->ndim; ++i) {
 		numel *= tensor->shape[i];
 	}
-    tensor->data = std::malloc(numel * sizeof(float));
+	int64_t itemsize = (tensor->dtype.bits * tensor->dtype.lanes + 7) / 8;
+    tensor->data = std::malloc(numel * itemsize);
   }
   void FreeData(DLTensor* tensor) { std::free(tensor->data); }
 };
@@ -229,7 +235,61 @@ int main(int argc, char* argv[]){
 
   tvm::ffi::Tensor input = tvm::ffi::Tensor::FromNDAlloc(CPUAllocator(), {1, 11, 11, 1}, DLDataType{kDLFloat, 32, 1}, dev);
 
+
+  // vm.set_instrument()
+  static std::unordered_map<std::string, unsigned long long> g_call_cycle_totals;
+  static std::unordered_map<std::string, unsigned long long> g_call_counts;
+  static std::vector<unsigned long long> g_call_stack;
+  
+  tvm::ffi::Optional<tvm::ffi::Function> set_instrument = mod->GetFunction("set_instrument");
+  if (set_instrument.has_value()) {
+    auto instrument_fn = tvm::ffi::Function::FromPacked(
+        [](tvm::ffi::PackedArgs args, tvm::ffi::Any* rv) {
+          // args[0] = func (VMClosure/PackedFunc)
+          // args[1] = func_symbol
+          // args[2] = before_run
+          // args[3] = ret_value (valid when before_run==false)
+          std::string func_symbol = args[1].cast<std::string>();
+          bool before_run = args[2].cast<bool>();
+  
+          if (before_run) {
+            g_call_stack.push_back(read_cycles());
+          } else {
+            unsigned long long start = g_call_stack.back();
+            g_call_stack.pop_back();
+            unsigned long long elapsed = read_cycles() - start;
+            g_call_cycle_totals[func_symbol] += elapsed;
+            g_call_counts[func_symbol] += 1;
+          }
+          *rv = int64_t(0);  // VMInstrumentReturnKind::kNoOp
+        });
+    (*set_instrument)(instrument_fn);
+  }
+
+
+
   tvm::ffi::Function main_func = mod->GetFunction("main").value();
+
+  tvm::ffi::Optional<tvm::ffi::Function> clock_cycles_func =
+      ex->GetFunction("gemmini_clock_cycles", /*query_imports=*/true);
+  bool have_clock_cycles = clock_cycles_func.has_value();
+  tvm::ffi::Tensor clock_cycles = tvm::ffi::Tensor::FromNDAlloc(
+      CPUAllocator(), {GEMMINI_NUM_CLOCK_CYCLES}, DLDataType{kDLUInt, 64, 1}, dev);
+  unsigned long long layer_cycles_total[GEMMINI_NUM_CLOCK_CYCLES] = {0};
+
+  auto print_layer_cycles = [&](unsigned long long* accumulate_into) {
+    if (!have_clock_cycles) return;
+    (*clock_cycles_func)(clock_cycles);
+    const uint64_t* c = static_cast<const uint64_t*>(clock_cycles.data_ptr());
+    unsigned long long sum = 0;
+    printf("layer cycles:");
+    for (int k = 0; k < GEMMINI_NUM_CLOCK_CYCLES; k++) {
+      printf(" %llu", (unsigned long long)c[k]);
+      sum += c[k];
+      if (accumulate_into) accumulate_into[k] += c[k];
+    }
+    printf(" (sum=%llu)\n", sum);
+  };
 
   printf("==============================================\n");
   printf("BraggNN Gemmini through TVM Relax VM\n");
@@ -250,10 +310,15 @@ int main(int argc, char* argv[]){
     const float* out_data = static_cast<const float*>(output.data_ptr());
     printf("cycles: %llu\n", end - start);
     printf("(x, y) = (%.4f, %.4f)\n", out_data[0] * 11, out_data[1] * 11);
+    print_layer_cycles(nullptr);  // warmup: not counted in the running average
   }
 
+  g_call_cycle_totals.clear();
+  g_call_counts.clear();
+
   unsigned long long total_cycles = 0;
-  double total_abs_error = 0.0;  // sum of |dx| + |dy| over all patches
+  double total_abs_error_x = 0.0;
+  double total_abs_error_y = 0.0;
 
   for (int i = 0; i < NUM_TEST_PATCHES; i++) {
     printf("\n--- Inference %d/%d ---\n", i + 1, NUM_TEST_PATCHES);
@@ -276,23 +341,37 @@ int main(int argc, char* argv[]){
     float label_y = kLabels[i][1];
     float abs_err_x = std::fabs(pred_x - label_x);
     float abs_err_y = std::fabs(pred_y - label_y);
-    total_abs_error += abs_err_x + abs_err_y;
+    total_abs_error_x += abs_err_x;
+    total_abs_error_y += abs_err_y;
 
     printf("cycles: %llu\n", elapsed);
     printf("predicted (x, y) = (%.4f, %.4f)\n", pred_x, pred_y);
     printf("label     (x, y) = (%.4f, %.4f)\n", label_x, label_y);
     printf("abs error (x, y) = (%.4f, %.4f)\n", abs_err_x, abs_err_y);
+    print_layer_cycles(layer_cycles_total);
   }
 
-  double mae = total_abs_error / (2.0 * NUM_TEST_PATCHES);
+  double mae_x = total_abs_error_x / NUM_TEST_PATCHES;
+  double mae_y = total_abs_error_y / NUM_TEST_PATCHES;
 
   printf("\n==============================================\n");
   printf("Avg cycles over %d runs: %llu\n", NUM_TEST_PATCHES,
          total_cycles / NUM_TEST_PATCHES);
-  printf("MAE over %d runs (x and y combined): %.4f\n", NUM_TEST_PATCHES, mae);
+  printf("MAE_x over %d runs: %.4f\n", NUM_TEST_PATCHES, mae_x);
+  printf("MAE_y over %d runs: %.4f\n", NUM_TEST_PATCHES, mae_y);
   printf("==============================================\n");
   printf("BraggNN inference completed successfully\n");
   printf("==============================================\n");
+
+
+  printf("\n--- Per-Call cycle breakdown (VM instrument) ---\n");
+  for (auto& kv : g_call_cycle_totals) {
+    printf("%-100s total=%12llu  calls/inference=%4llu  total/calls=%10llu  calls/inference=%10llu  total/inference=%10llu\n",
+           kv.first.c_str(), kv.second, g_call_counts[kv.first],
+           kv.second / g_call_counts[kv.first],
+		   g_call_counts[kv.first] / NUM_TEST_PATCHES,
+		   kv.second / NUM_TEST_PATCHES);
+  }
 
   return 0;
 }
