@@ -548,7 +548,6 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 		  return {s[s.size() - 2], s[s.size() - 1]};       // 2D/3D operand: (rows, cols)
 	  };
 
-	  // Stage 1 dims: raw logits = theta @ phi (contraction over the hidden channel dim).
 	  std::pair<int64_t, int64_t> theta_dims = matrix_dims(theta_shape);
 	  std::pair<int64_t, int64_t> phi_dims = matrix_dims(phi_shape);
 	  int64_t dim_I0 = theta_dims.first;
@@ -562,16 +561,9 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 	  double bert_scale = attrs.at("bert_scale").try_cast<double>().value();
 	  double acc_scale1 = attrs.at("acc_scale1").try_cast<double>().value();
 
-	  // Stage 2 dims: attention = logits @ identity_N (SOFTMAX). N = dim_J0, the softmax
-	  // axis width -- tiled_matmul_auto's dim_K must equal this so the norm unit's
-	  // row-wise reduction spans the full softmax row.
-	  int64_t N = dim_J0;
-
-	  // Stage 3 dims: out = attention @ g -- identical derivation to the old
-	  // matmul_transpose composite (attention rows = dim_I0, contraction = N).
 	  std::pair<int64_t, int64_t> g_dims = matrix_dims(g_shape);
 	  int64_t dim_I2 = dim_I0;
-	  int64_t dim_K2 = N;
+	  int64_t dim_K2 = dim_J0;
 	  bool transpose_B2 = (g_dims.first != dim_K2);
 	  int64_t dim_J2 = transpose_B2 ? g_dims.first : g_dims.second;
 	  int64_t stride_A2 = dim_K2;
@@ -579,24 +571,10 @@ class CodegenGemmini : public relax::MemoizedExprTranslator<OutputType>,
 
 	  std::string logits = out + "_logits";
 	  std::string attnbuf = out + "_attn";
-	  std::string ident = out + "_identity";
-
-	  // The N x N identity matrix is a fixed 0/1 pattern known entirely at codegen time, so
-	  // emit it as a compile-time literal initializer instead of a runtime double loop --
-	  // matches the convention elsewhere in this file of emitting constant data as
-	  // `static const <type> <name>[] = {...}` rather than computing it on-device.
-	  std::ostringstream ident_init;
-	  for (int64_t i = 0; i < N; ++i) {
-		  for (int64_t j = 0; j < N; ++j) {
-			  if (i != 0 || j != 0) ident_init << ",";
-			  ident_init << (i == j ? "1" : "0");
-		  }
-	  }
 
 	  std::ostringstream ss;
 	  ss << "static elem_t " << logits << "[" << (dim_I0 * dim_J0) << "];\n  "
-		 << "static elem_t " << attnbuf << "[" << (dim_I0 * N) << "];\n  "
-		 << "static const elem_t " << ident << "[" << (N * N) << "] = {" << ident_init.str() << "};\n  ";
+		 << "static elem_t " << attnbuf << "[" << (dim_I0 * dim_J0) << "];\n  ";
 
 	  ss << "unsigned long long start = read_cycles();\n"
 	     << "tiled_matmul_auto("
